@@ -1,0 +1,15 @@
+version: "3.9"
+
+services:
+  omnetpp:
+    image: ghcr.io/omnetpp/omnetpp-gui:u24.04-6.2.0
+    container_name: omnetpp-gui
+    restart: unless-stopped
+    environment:
+      - DISPLAY=${DISPLAY}          # Forward X11 display for GUI
+    volumes:
+      - ./simulations:/workspace    # Map your local simulation folder
+      - /tmp/.X11-unix:/tmp/.X11-unix
+    network_mode: "host"           # Necessary for GUI to connect to host X server
+    stdin_open: true
+    tty: true
