@@ -100,8 +100,13 @@ void Wca::handleMessage(cMessage *msg)
     }
     else {
         Packet *packet = check_and_cast<Packet *>(msg);
-        auto wcaPacket = packet->peekAtFront<WcaPacket>();
+        auto ipv4Header = packet->popAtFront<inet::Ipv4Header>();
 
+        const Ptr<const WcaPacket> wcaPacket = packet->peekAtFront<WcaPacket>();
+        if (!wcaPacket) {
+            EV_WARN << "Received packet without WcaPacket chunk!\n";
+            return;
+        }
         switch (wcaPacket->getPacketType()) {
             case WcaPacketType::HELLO:
                 processHelloPacket(packet);
