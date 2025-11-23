@@ -1,4 +1,4 @@
-package hwca.simulations.wca;
+package hwca.simulations;
 
 import inet.networklayer.configurator.ipv4.Ipv4NetworkConfigurator;
 import inet.node.inet.AdhocHost;
@@ -26,8 +26,8 @@ network WcaNetwork
         }
 
         // Mobile robots with WCA clustering
-        host[numHosts]: AdhocHost {
-            @display("p=uniform(100,1100);i=device/robot");
+        host[numHosts]: WcaHost {
+            @display("i=device/robot");
         }
 
         // Access Points (stationary)
