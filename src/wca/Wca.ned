@@ -6,7 +6,7 @@ simple Wca like IManetRouting
 {
     parameters:
         @display("i=block/network2");
-        @class(Wca);
+        @class(hwca::Wca);
 
         // Interface parameters
         string interfaceTableModule;
