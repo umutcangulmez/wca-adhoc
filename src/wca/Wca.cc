@@ -124,7 +124,6 @@ void Wca::handleMessage(cMessage *msg)
                 EV_WARN << "Unknown packet type received\n";
                 break;
         }
-        delete packet;
     }
 }
 
