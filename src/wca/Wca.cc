@@ -362,10 +362,19 @@ void Wca::processJoinReply(Packet *packet)
 
 void Wca::sendPacket(Packet *packet, const Ipv4Address& destAddr)
 {
+    Enter_Method_Silent();
+    take(packet);
+
     packet->addTagIfAbsent<PacketProtocolTag>()->setProtocol(&Protocol::manet);
     packet->addTagIfAbsent<DispatchProtocolReq>()->setProtocol(&Protocol::ipv4);
-    packet->addTagIfAbsent<L3AddressReq>()->setDestAddress(destAddr);
-    packet->addTagIfAbsent<L3AddressReq>()->setSrcAddress(myAddress);
+    // Wrap addresses as L3Address
+    L3Address srcL3(myAddress);
+    L3Address dstL3(destAddr);
+    // Add IPv4 addresses (tag)
+    Ptr<L3AddressReq> addrReq = packet->addTagIfAbsent<L3AddressReq>();
+    addrReq->setSrcAddress(srcL3);
+    addrReq->setDestAddress(dstL3);
+
     packet->addTagIfAbsent<InterfaceReq>()->setInterfaceId(interface80211->getInterfaceId());
 
     send(packet, "ipOut");
