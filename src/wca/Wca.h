@@ -11,6 +11,7 @@
 #include <map>
 #include <set>
 #include "WcaPacket_m.h"
+#include "WcaMetricsLogger.h"
 
 namespace hwca {
 
@@ -66,6 +67,12 @@ class INET_API Wca : public cSimpleModule, public NetfilterBase::HookBase
 
     // Statistics
     simsignal_t clusterHeadChangedSignal;
+
+    // Logger
+    WCAMetricsLogger* metricsLogger;
+    cMessage *metricTimer;
+    int packetIdCounter;
+    std::map<int, simtime_t> packetSendTimes;
 
   protected:
     virtual int numInitStages() const override { return NUM_INIT_STAGES; }

@@ -17,6 +17,7 @@ Wca::~Wca()
 {
     cancelAndDelete(helloTimer);
     cancelAndDelete(clusterTimer);
+    cancelAndDelete(metricTimer);
 }
 
 void Wca::initialize(int stage)
@@ -42,6 +43,18 @@ void Wca::initialize(int stage)
         // Initialize timers
         helloTimer = new cMessage("helloTimer");
         clusterTimer = new cMessage("clusterTimer");
+
+        // Initialize metric logger
+        metricsLogger = new WCAMetricsLogger();
+        std::string nodeId = std::to_string(getContainingNode(this)->getIndex());
+        std::string logFile = "results/wca_performance_node" + nodeId + ".log";
+        std::string csvFile = "results/wca_metrics_node" + nodeId + ".csv";
+        metricsLogger->initialize(logFile.c_str(), csvFile.c_str());
+
+        // Schedule periodic metric calculation
+        metricTimer = new cMessage("metricTimer");
+        scheduleAt(simTime() + 10.0, metricTimer);
+        packetIdCounter = 0;
 
         // Initialize signal
         clusterHeadChangedSignal = registerSignal("clusterHeadChanged");
@@ -97,6 +110,10 @@ void Wca::handleMessage(cMessage *msg)
             removeStaleNeighbors();
             scheduleAt(simTime() + clusterTimeout, clusterTimer);
         }
+        else if (msg == metricTimer) {
+            metricsLogger->calculateAndLogMetrics(simTime());
+            scheduleAt(simTime() + 10.0, msg);
+        }
     }
     else {
         Packet *packet = check_and_cast<Packet *>(msg);
@@ -105,23 +122,31 @@ void Wca::handleMessage(cMessage *msg)
         const Ptr<const WcaPacket> wcaPacket = packet->peekAtFront<WcaPacket>();
         if (!wcaPacket) {
             EV_WARN << "Received packet without WcaPacket chunk!\n";
+            metricsLogger->logPacketDropped(0, getContainingNode(this)->getIndex(),
+                                          "Missing WCA header", simTime()); // todo look into this again
             return;
         }
         switch (wcaPacket->getPacketType()) {
             case WcaPacketType::HELLO:
                 processHelloPacket(packet);
+                metricsLogger->logRoutingOverhead(1);
                 break;
             case WcaPacketType::CLUSTER_HEAD_ANNOUNCEMENT:
                 processCHAnnouncement(packet);
+                metricsLogger->logRoutingOverhead(1);
                 break;
             case WcaPacketType::JOIN_REQUEST:
                 processJoinRequest(packet);
+                metricsLogger->logRoutingOverhead(1);
                 break;
             case WcaPacketType::JOIN_REPLY:
                 processJoinReply(packet);
+                metricsLogger->logRoutingOverhead(1);
                 break;
             default:
                 EV_WARN << "Unknown packet type received\n";
+                metricsLogger->logPacketDropped(0, getContainingNode(this)->getIndex(),
+                                              "Unknown packet type", simTime());
                 break;
         }
     }
@@ -196,6 +221,11 @@ void Wca::performClusterElection()
             joinCluster(bestCH);
         }
     }
+    if (isClusterHead) {
+        std::vector<int> chList;
+        chList.push_back(getContainingNode(this)->getIndex()); // Add self as CH
+        metricsLogger->logClusterFormation(chList.size(), chList);
+    }
 }
 
 double Wca::calculateWeight()
@@ -237,8 +267,17 @@ double Wca::calculateMobility()
 double Wca::getBatteryLevel()
 {
     if (energyStorage) {
-        return energyStorage->getResidualEnergyCapacity().get() /
-               energyStorage->getNominalEnergyCapacity().get();
+        double currentEnergy = energyStorage->getResidualEnergyCapacity().get();
+        double nominalEnergy = energyStorage->getNominalEnergyCapacity().get();
+        double consumed = nominalEnergy - currentEnergy;
+
+        static simtime_t lastEnergyLog = 0;
+        if (simTime() - lastEnergyLog > 5.0) {  // Log every 5 seconds
+            metricsLogger->logEnergyConsumption(getContainingNode(this)->getIndex(), consumed);
+            lastEnergyLog = simTime();
+        }
+
+        return currentEnergy / nominalEnergy;
     }
     return 1.0;  // Full battery if no energy model
 }
@@ -294,6 +333,10 @@ void Wca::becomeClusterHead()
 
     packet->insertAtBack(announce);
     sendPacket(packet, Ipv4Address::ALLONES_ADDRESS);
+
+    std::vector<int> chList;
+    chList.push_back(getContainingNode(this)->getIndex());
+    metricsLogger->logClusterFormation(1, chList);
 }
 
 void Wca::joinCluster(const Ipv4Address& chAddress)
@@ -399,6 +442,8 @@ void Wca::finish()
     EV_INFO << "WCA finish - isClusterHead: " << isClusterHead
             << ", neighbors: " << neighbors.size()
             << ", members: " << clusterMembers.size() << "\n";
+    metricsLogger->finalizeAndClose();
+    delete metricsLogger;
 }
 
 } // namespace hwca
