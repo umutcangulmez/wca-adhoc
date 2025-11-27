@@ -35,14 +35,17 @@ void Wca::initialize(int stage)
         batteryWeight = par("batteryWeight");
         radioRange = par("radioRange");
 
+        // Get server address from parameter
+        serverAddress = Ipv4Address(par("serverAddress").stringValue());
+
         // Initialize state
         isClusterHead = false;
-        myWeight = 0.0;
         lastMobilityUpdate = simTime();
 
         // Initialize timers
         helloTimer = new cMessage("helloTimer");
         clusterTimer = new cMessage("clusterTimer");
+        metricTimer = new cMessage("metricTimer");
 
         // Initialize metric logger
         metricsLogger = new WCAMetricsLogger();
@@ -52,8 +55,6 @@ void Wca::initialize(int stage)
         metricsLogger->initialize(logFile.c_str(), csvFile.c_str());
 
         // Schedule periodic metric calculation
-        metricTimer = new cMessage("metricTimer");
-        scheduleAt(simTime() + 10.0, metricTimer);
         packetIdCounter = 0;
 
         // Initialize signal
@@ -66,6 +67,7 @@ void Wca::initialize(int stage)
 
         // Find 802.11 interface
         for (int i = 0; i < interfaceTable->getNumInterfaces(); i++) {
+            EV_INFO << "interface table" << endl;
             NetworkInterface *ie = interfaceTable->getInterface(i);
             if (strstr(ie->getInterfaceName(), "wlan") != nullptr) {
                 interface80211 = ie;
@@ -92,9 +94,14 @@ void Wca::initialize(int stage)
         INetfilter *netfilter = getModuleFromPar<INetfilter>(par("networkProtocolModule"), this);
         netfilter->registerHook(0, this);
 
+        // calculate weight
+        myWeight = calculateWeight();
+        EV_INFO << "Initial weight of node " << myAddress << " = " << myWeight << endl;
+
         // Schedule first hello
         scheduleAt(simTime() + uniform(0, 0.1), helloTimer);
         scheduleAt(simTime() + clusterTimeout, clusterTimer);
+        scheduleAt(simTime() + 10.0, metricTimer);
     }
 }
 
@@ -118,12 +125,12 @@ void Wca::handleMessage(cMessage *msg)
     else {
         Packet *packet = check_and_cast<Packet *>(msg);
         auto ipv4Header = packet->popAtFront<inet::Ipv4Header>();
+        int hopCount = 0;
 
         const Ptr<const WcaPacket> wcaPacket = packet->peekAtFront<WcaPacket>();
         if (!wcaPacket) {
-            EV_WARN << "Received packet without WcaPacket chunk!\n";
-            metricsLogger->logPacketDropped(0, getContainingNode(this)->getIndex(),
-                                          "Missing WCA header", simTime()); // todo look into this again
+            metricsLogger->logPacketReceived(packetIdCounter++, getContainingNode(this)->getIndex(),
+                                             simTime(), hopCount);
             return;
         }
         switch (wcaPacket->getPacketType()) {
@@ -171,6 +178,8 @@ void Wca::sendHelloPacket()
     hello->setChunkLength(B(64));
 
     packet->insertAtBack(hello);
+    // Add hopCount parameter
+    packet->addPar("hopCount") = 0;
     sendPacket(packet, Ipv4Address::ALLONES_ADDRESS);
 }
 
@@ -198,6 +207,17 @@ void Wca::performClusterElection()
         }
     }
 
+
+    // If no neighbors, become cluster head by default
+
+    if (neighbors.empty()) {
+
+        EV_INFO << "Node " << myAddress << " has no neighbors, becoming isolated CH\n";
+
+        shouldBeClusterHead = true;
+
+    }
+
     if (shouldBeClusterHead && !isClusterHead) {
         becomeClusterHead();
     }
@@ -221,10 +241,15 @@ void Wca::performClusterElection()
             joinCluster(bestCH);
         }
     }
-    if (isClusterHead) {
+    else if (shouldBeClusterHead && isClusterHead) {
         std::vector<int> chList;
-        chList.push_back(getContainingNode(this)->getIndex()); // Add self as CH
-        metricsLogger->logClusterFormation(chList.size(), chList);
+        chList.push_back(getContainingNode(this)->getIndex());
+
+
+        metricsLogger->logClusterFormation(1, chList);
+        EV_INFO << "Node " << getContainingNode(this)->getIndex()
+                << " remains CH with " << clusterMembers.size() << " members\n";
+
     }
 }
 
@@ -334,9 +359,6 @@ void Wca::becomeClusterHead()
     packet->insertAtBack(announce);
     sendPacket(packet, Ipv4Address::ALLONES_ADDRESS);
 
-    std::vector<int> chList;
-    chList.push_back(getContainingNode(this)->getIndex());
-    metricsLogger->logClusterFormation(1, chList);
 }
 
 void Wca::joinCluster(const Ipv4Address& chAddress)
@@ -408,6 +430,15 @@ void Wca::sendPacket(Packet *packet, const Ipv4Address& destAddr)
     Enter_Method_Silent();
     take(packet);
 
+    // Assign packet ID for metrics
+    int packetId = packetIdCounter++;
+
+    // Log sent packet
+    metricsLogger->logPacketSent(packetId, getContainingNode(this)->getIndex(), destAddr.getInt(), simTime());
+    // Initialize hopCount if missing
+    if (!packet->hasPar("hopCount"))
+        packet->addPar("hopCount") = 0;
+
     packet->addTagIfAbsent<PacketProtocolTag>()->setProtocol(&Protocol::manet);
     packet->addTagIfAbsent<DispatchProtocolReq>()->setProtocol(&Protocol::ipv4);
     // Wrap addresses as L3Address
@@ -434,7 +465,99 @@ INetfilter::IHook::Result Wca::datagramPreRoutingHook(Packet *packet)
         return STOLEN;
     }
 
+    else if (networkHeader->getProtocol() == &Protocol::udp) {
+        int packetId = packetIdCounter++;
+        forwardDataPacket(packet, packetId);
+        return STOLEN;
+    }
     return ACCEPT;
+
+}
+
+
+
+void Wca::forwardDataPacket(Packet *packet, int packetId)
+{
+    Enter_Method_Silent();
+    take(packet);
+
+
+    auto ipv4Header = packet->peekAtFront<Ipv4Header>();
+    Ipv4Address dest = ipv4Header->getDestAddress();
+    Ipv4Address source = ipv4Header->getSrcAddress();
+    Ipv4Address nextHop;
+
+    // Initialize hop count if it doesn't exist
+    int hopCount = 0;
+    if (packet->hasPar("hopCount")) {
+        hopCount = packet->par("hopCount").longValue();
+    } else {
+        packet->addPar("hopCount") = 0;
+    }
+
+    // All traffic goes through server
+    // If this node is the server
+    if (myAddress == serverAddress) {
+        // Server receives and forwards to destination
+        if (dest == myAddress) {
+            // Packet reached server (final destination)
+            EV_INFO << "Server received packet from " << source << "\n";
+            metricsLogger->logPacketReceived(packetId, getContainingNode(this)->getIndex(), simTime(), hopCount);
+            delete packet;
+            return;
+        } else {
+            // Server forwards to destination node
+            nextHop = dest;
+            EV_INFO << "Server forwarding packet to destination " << dest << "\n";
+        }
+    }
+    // If this node is NOT the server
+    else {
+        // If packet is arriving at its destination
+        if (dest == myAddress) {
+            EV_INFO << "Packet reached destination " << myAddress << "\n";
+            metricsLogger->logPacketReceived(packetId, getContainingNode(this)->getIndex(), simTime(), hopCount);
+            delete packet;
+            return;
+        }
+
+        // If packet is from this node or needs forwarding, send to server
+        nextHop = serverAddress;
+        EV_INFO << "Node " << myAddress << " forwarding packet to server " << serverAddress << "\n";
+    }
+
+    if (nextHop.isUnspecified()) {
+        EV_WARN << "No next hop for packet " << packet->getName() << ", dropping\n";
+        metricsLogger->logPacketDropped(packetId, getContainingNode(this)->getIndex(), "No next hop", simTime());
+        delete packet;
+        return;
+    }
+
+    // Update hop count
+    hopCount++;
+    packet->par("hopCount") = hopCount;
+
+    // Remove old IPv4 header and recreate with proper addressing
+    packet->popAtFront<Ipv4Header>();
+
+
+
+    // Create new IPv4 header
+    auto newHeader = makeShared<Ipv4Header>();
+    newHeader->setSrcAddress(source);
+    newHeader->setDestAddress(dest);
+    newHeader->setProtocol(&Protocol::udp);
+    newHeader->setTimeToLive(64);
+    newHeader->setIdentification(packetId);
+
+
+
+    packet->insertAtFront(newHeader);
+    sendPacket(packet, nextHop);
+}
+
+Ipv4Address Wca::findNearestAP() {
+    return serverAddress;
 }
 
 void Wca::finish()

@@ -21,6 +21,7 @@ class WcaPacket extends inet::FieldsChunk
     int packetType @enum(WcaPacketType);
     inet::Ipv4Address sourceAddress;
     inet::Ipv4Address destAddress;
+    unsigned int sequenceNumber;
 
     // WCA parameters
     double weight;

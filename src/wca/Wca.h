@@ -55,6 +55,8 @@ class INET_API Wca : public cSimpleModule, public NetfilterBase::HookBase
     bool isClusterHead;
     Ipv4Address myClusterHead;
     Ipv4Address myAddress;
+    Ipv4Address serverAddress;
+
     std::map<Ipv4Address, NeighborInfo> neighbors;
     std::set<Ipv4Address> clusterMembers;
     double myWeight;
@@ -109,7 +111,11 @@ class INET_API Wca : public cSimpleModule, public NetfilterBase::HookBase
     virtual Result datagramPostRoutingHook(Packet *packet) override { return ACCEPT; }
     virtual Result datagramLocalInHook(Packet *packet) override { return ACCEPT; }
     virtual Result datagramLocalOutHook(Packet *packet) override { return ACCEPT; }
+    // Forwarding helper for data packets
+    void forwardDataPacket(Packet *packet, int packetId);
 
+    // Find nearest Access Point
+    Ipv4Address findNearestAP();
   public:
     Wca() {}
     virtual ~Wca();
