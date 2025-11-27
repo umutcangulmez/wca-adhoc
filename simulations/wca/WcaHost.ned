@@ -10,6 +10,10 @@ module WcaHost extends AdhocHost
 
     submodules:
         wca: Wca {
+            parameters:
+                interfaceTableModule = "^.interfaceTable";
+                routingTableModule = "^.ipv4.routingTable";
+                networkProtocolModule = "^.ipv4.ip";
             @display("p=825,226");
         }
 

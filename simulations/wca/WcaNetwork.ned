@@ -6,6 +6,8 @@ import inet.node.wireless.AccessPoint;
 import inet.node.inet.Router;
 import inet.node.ethernet.Eth100M;
 import inet.physicallayer.wireless.ieee80211.packetlevel.Ieee80211ScalarRadioMedium;
+import inet.node.inet.StandardHost;
+
 
 network WcaNetwork
 {
@@ -44,8 +46,14 @@ network WcaNetwork
             @display("p=600,100;i=abstract/router");
         }
 
+        server: StandardHost {
+            @display("p=600,300;i=device/server");
+        }
+
     connections:
         // Connect APs to router via ethernet
         ap0.ethg++ <--> Eth100M <--> router.ethg++;
         ap1.ethg++ <--> Eth100M <--> router.ethg++;
+        server.ethg++ <--> Eth100M <--> router.ethg++;
+
 }
