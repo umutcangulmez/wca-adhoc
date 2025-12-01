@@ -7,7 +7,7 @@ module WcaHost extends AdhocHost
 {
     parameters:
         @display("i=device/robot");
-
+        hasStatus = default(true);
     submodules:
         wca: Wca {
             parameters:
@@ -20,4 +20,6 @@ module WcaHost extends AdhocHost
     connections:
         wca.ipOut --> tn.in++;
         wca.ipIn <-- tn.out++;
+        wca.socketOut --> at.in++;
+        wca.socketIn <-- at.out++;
 }
