@@ -1,11 +1,14 @@
-#ifndef __INET_WCA_H
-#define __INET_WCA_H
+#ifndef __HWCA_WCA_H
+#define __HWCA_WCA_H
+
+#include <omnetpp.h>
+#include <map>
+#include <set>
 
 #include "inet/common/INETDefs.h"
 #include "inet/networklayer/ipv4/Ipv4InterfaceData.h"
 #include "inet/networklayer/contract/IInterfaceTable.h"
-#include "inet/networklayer/ipv4/IIpv4RoutingTable.h"
-#include "inet/networklayer/contract/INetfilter.h"
+#include "inet/networklayer/ipv4/Ipv4RoutingTable.h"
 #include "inet/mobility/contract/IMobility.h"
 #include "inet/power/contract/IEpEnergyStorage.h"
 #include "inet/common/geometry/common/Coord.h"
@@ -111,12 +114,8 @@ class Wca : public cSimpleModule, public NetfilterBase::HookBase
     void updateNeighborInfo(const Ptr<const WcaPacket>& wcaPacket, const Ipv4Address& senderAddr);
     void removeStaleNeighbors();
 
-    // Helper functions
-    virtual void updateNeighborInfo(const Ptr<const WcaPacket>& wcaPacket, const Ipv4Address& senderAddr);
-    virtual void removeStaleNeighbors();
-    virtual void sendPacket(Packet *packet, const Ipv4Address& destAddr);
-    virtual void becomeClusterHead();
-    virtual void joinCluster(const Ipv4Address& chAddress);
+    void sendPacket(Packet *packet, const Ipv4Address& destAddr);
+    void forwardDataPacket(Packet *packet);
 
     // Visualization
     void initializeVisualization();

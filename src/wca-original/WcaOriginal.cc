@@ -2,10 +2,14 @@
 #include "inet/common/ModuleAccess.h"
 #include "inet/common/ProtocolTag_m.h"
 #include "inet/networklayer/common/L3AddressTag_m.h"
+#include "inet/networklayer/common/NextHopAddressTag_m.h"
 #include "inet/networklayer/ipv4/Ipv4Header_m.h"
 #include "inet/common/packet/Packet.h"
 #include "inet/linklayer/common/InterfaceTag_m.h"
 #include "inet/common/Ptr.h"
+#include <omnetpp.h>
+#include <sstream>
+#include <iomanip>
 
 namespace hwca {
 
@@ -845,15 +849,24 @@ INetfilter::IHook::Result Wca::datagramPreRoutingHook(Packet *packet)
     const auto& networkHeader = packet->peekAtFront<Ipv4Header>();
 
     if (networkHeader->getProtocol() == &Protocol::manet) {
-        EV_INFO << "WCA packet received\n";
-        take(packet);
-        handleMessage(packet);
-        return STOLEN;
+        EV_DEBUG << "WCA packet received via netfilter hook" << endl;
+
+        auto wcaPacket = packet->peekDataAt<WcaPacket>(networkHeader->getChunkLength());
+        if (wcaPacket) {
+            processWcaPacket(packet, wcaPacket);
+        }
+
+        return DROP;
     }
     else if (networkHeader->getProtocol() == &Protocol::udp) {
-        int packetId = packetIdCounter++;
-        forwardDataPacket(packet, packetId);
-        return STOLEN;
+        Ipv4Address destAddr = networkHeader->getDestAddress();
+
+        if (destAddr == myAddress) {
+            return ACCEPT;
+        }
+
+        forwardDataPacket(packet);
+        return DROP;
     }
 
     return ACCEPT;
@@ -949,32 +962,52 @@ void Wca::forwardDataPacket(Packet *packet)
         return;
     }
 
-    // Update hop count
-    hopCount++;
-    packet->par("hopCount") = hopCount;
+    Packet *fwdPacket = new Packet(packet->getName());
 
-    // Remove old IPv4 header and recreate
-    packet->popAtFront<Ipv4Header>();
+    auto payload = packet->peekDataAt(ipv4Header->getChunkLength(),
+                                       packet->getDataLength() - ipv4Header->getChunkLength());
+    fwdPacket->insertAtBack(payload);
 
-    // Create new IPv4 header
-    auto newHeader = makeShared<Ipv4Header>();
-    newHeader->setSrcAddress(source);
-    newHeader->setDestAddress(dest);
-    newHeader->setProtocol(&Protocol::udp);
-    newHeader->setTimeToLive(64);
-    newHeader->setIdentification(packetId);
+    int hopCount = 0;
+    if (packet->hasPar("hopCount")) {
+        hopCount = packet->par("hopCount").longValue() + 1;
+    }
+    fwdPacket->addPar("hopCount") = hopCount;
 
-    packet->insertAtFront(newHeader);
-    sendPacket(packet, nextHop);
+    fwdPacket->addTagIfAbsent<PacketProtocolTag>()->setProtocol(&Protocol::udp);
+    fwdPacket->addTagIfAbsent<DispatchProtocolReq>()->setProtocol(&Protocol::ipv4);
+
+    auto addrReq = fwdPacket->addTagIfAbsent<L3AddressReq>();
+    addrReq->setSrcAddress(L3Address(source));
+    addrReq->setDestAddress(L3Address(dest));
+
+    fwdPacket->addTagIfAbsent<NextHopAddressReq>()->setNextHopAddress(L3Address(nextHop));
+    fwdPacket->addTagIfAbsent<InterfaceReq>()->setInterfaceId(interface80211->getInterfaceId());
+
+    EV_DEBUG << "Forwarding packet to " << nextHop << " (dest=" << dest << ")" << endl;
+    send(fwdPacket, "ipOut");
 }
 
 void Wca::finish()
 {
-    EV_INFO << "WCA finish - isClusterHead: " << isClusterHead
-            << ", neighbors: " << neighbors.size()
-            << ", members: " << clusterMembers.size() << "\n";
-    metricsLogger->finalizeAndClose();
-    delete metricsLogger;
+    // Update final CH time if still a CH
+    if (isClusterHead && lastCHStartTime > 0) {
+        cumulativeCHTime += (simTime() - lastCHStartTime);
+    }
+
+    EV_INFO << "=== Node " << myNodeId << " Final Statistics ===" << endl
+            << "  CH status: " << (isClusterHead ? "Cluster Head" : "Member") << endl
+            << "  Cluster head: " << (isClusterHead ? myAddress : myClusterHead) << endl
+            << "  Neighbors: " << neighbors.size() << endl
+            << "  Cluster members: " << clusterMembers.size() << endl
+            << "  Final weight: " << myWeight << endl
+            << "  Total CH time: " << cumulativeCHTime << "s" << endl;
+
+    if (metricsLogger) {
+        metricsLogger->finalizeAndClose();
+        delete metricsLogger;
+        metricsLogger = nullptr;
+    }
 }
 
 } // namespace hwca
