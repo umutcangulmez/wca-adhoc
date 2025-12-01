@@ -348,14 +348,15 @@ void Wca::sendHelloPacket()
     Packet *packet = new Packet("WCA-HELLO");
     const auto& hello = makeShared<WcaPacket>();
 
+    myWeight = calculateWeight();
     hello->setPacketType(WcaPacketType::HELLO);
     hello->setSourceAddress(myAddress);
     hello->setDestAddress(Ipv4Address::ALLONES_ADDRESS);
-    hello->setWeight(calculateWeight());
+    hello->setWeight(myWeight);
     hello->setNodeDegree(getNodeDegree());
     hello->setTransmissionPower(maxTransmissionPower);
     hello->setMobility(calculateMobility());
-    hello->setBatteryPower(getBatteryLevel());
+    hello->setBatteryPower(1.0);  // Not used in correct WCA
     hello->setIsClusterHead(isClusterHead);
     hello->setClusterHeadAddress(isClusterHead ? myAddress : myClusterHead);
     hello->setTimestamp(simTime());
