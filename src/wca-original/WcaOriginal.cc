@@ -52,28 +52,26 @@ void Wca::initialize(int stage)
         clusterTimeout = par("clusterTimeout");
         maxTransmissionPower = par("maxTransmissionPower");
         degreeWeight = par("degreeWeight");
-        transmissionWeight = par("transmissionWeight");
+        distanceWeight = par("distanceWeight");
         mobilityWeight = par("mobilityWeight");
-        batteryWeight = par("batteryWeight");
+        clusterHeadTimeWeight = par("clusterHeadTimeWeight");
         radioRange = par("radioRange");
+        idealDegree = par("idealDegree");
 
         // Initialize state
         isClusterHead = false;
+        myNodeId = -1;
         lastMobilityUpdate = simTime();
+
+        // Initialize cumulative CH time tracking
+        cumulativeCHTime = 0;
+        lastCHStartTime = 0;
 
         // Initialize timers
         helloTimer = new cMessage("helloTimer");
         clusterTimer = new cMessage("clusterTimer");
         metricTimer = new cMessage("metricTimer");
 
-        // Initialize metric logger
-        metricsLogger = new WCAMetricsLogger();
-        std::string nodeId = std::to_string(getContainingNode(this)->getIndex());
-        std::string logFile = "results/wca_performance_node" + nodeId + ".log";
-        std::string csvFile = "results/wca_metrics_node" + nodeId + ".csv";
-        metricsLogger->initialize(logFile.c_str(), csvFile.c_str());
-
-        // Schedule periodic metric calculation
         packetIdCounter = 0;
 
         // Initialize signal
@@ -109,6 +107,7 @@ void Wca::initialize(int stage)
 
         // Get my address
         myAddress = interface80211->getProtocolData<Ipv4InterfaceData>()->getIPAddress();
+        myNodeId = getContainingNode(this)->getIndex();
 
         // Get mobility module
         mobility = check_and_cast<IMobility *>(getParentModule()->getSubmodule("mobility"));
@@ -120,11 +119,22 @@ void Wca::initialize(int stage)
             host->getSubmodule("energyStorage"));
 
         // Register netfilter hook
-        INetfilter *netfilter = getModuleFromPar<INetfilter>(par("networkProtocolModule"), this);
-        netfilter->registerHook(0, this);
         networkProtocol = getModuleFromPar<INetfilter>(par("networkProtocolModule"), this);
         networkProtocol->registerHook(0, this);
 
+        // Initialize metric logger
+        metricsLogger = new WCAMetricsLogger();
+        std::string nodeIdStr = std::to_string(myNodeId);
+        std::string logFile = "results/wca_performance_node" + nodeIdStr + ".log";
+        std::string csvFile = "results/wca_metrics_node" + nodeIdStr + ".csv";
+        metricsLogger->initialize(logFile.c_str(), csvFile.c_str());
+        metricsLogger->setNodeId(myNodeId);
+
+        // Set initial energy if available
+        if (energyStorage) {
+            double initialEnergy = energyStorage->getNominalEnergyCapacity().get();
+            metricsLogger->setInitialEnergy(initialEnergy);
+        }
 
         // Calculate initial weight
         myWeight = calculateWeight();

@@ -8,8 +8,7 @@
 #include "inet/networklayer/contract/INetfilter.h"
 #include "inet/mobility/contract/IMobility.h"
 #include "inet/power/contract/IEpEnergyStorage.h"
-#include <map>
-#include <set>
+#include "inet/common/geometry/common/Coord.h"
 #include "inet/networklayer/contract/INetfilter.h"
 #include "WcaPacket_m.h"
 #include "WcaMetricsLogger.h"
@@ -53,16 +52,22 @@ class INET_API Wca : public cSimpleModule, public NetfilterBase::HookBase
     double helloInterval;
     double clusterTimeout;
     double maxTransmissionPower;
-    double degreeWeight;
-    double transmissionWeight;
-    double mobilityWeight;
-    double batteryWeight;
+    double degreeWeight;           // w1: weight for degree difference
+    double distanceWeight;         // w2: weight for sum of distances
+    double mobilityWeight;         // w3: weight for mobility
+    double clusterHeadTimeWeight;  // w4: weight for cumulative CH time
     double radioRange;
+    int idealDegree;               // Ideal number of neighbors
 
-    // State variables
+    int myNodeId;
+    Ipv4Address myAddress;
+    double myWeight;
     bool isClusterHead;
     Ipv4Address myClusterHead;
-    Ipv4Address myAddress;
+
+    // Cumulative CH Time Tracking
+    simtime_t cumulativeCHTime;
+    simtime_t lastCHStartTime;
 
     std::map<Ipv4Address, NeighborInfo> neighbors;
     std::set<Ipv4Address> clusterMembers;
@@ -81,12 +86,12 @@ class INET_API Wca : public cSimpleModule, public NetfilterBase::HookBase
     Coord previousPosition;
     simtime_t lastMobilityUpdate;
 
-    // Timers
-    cMessage *helloTimer = nullptr;
-    cMessage *clusterTimer = nullptr;
+    WCAMetricsLogger *metricsLogger = nullptr;
+    int packetIdCounter;
 
-    // Statistics
     simsignal_t clusterHeadChangedSignal;
+    simsignal_t weightSignal;
+    simsignal_t neighborCountSignal;
 
     // Visualization
     cCanvas *canvas = nullptr;
@@ -132,7 +137,6 @@ class INET_API Wca : public cSimpleModule, public NetfilterBase::HookBase
     int getNodeIdFromAddress(const Ipv4Address& addr);
 
   public:
-    Wca() {}
     virtual ~Wca();
 };
 
