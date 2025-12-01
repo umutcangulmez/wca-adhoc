@@ -340,9 +340,8 @@ void Wca::sendHelloPacket()
     sendPacket(packet, Ipv4Address::ALLONES_ADDRESS);
 }
 
-void Wca::processHelloPacket(Packet *packet)
+void Wca::processHelloPacket(const Ptr<const WcaPacket>& wcaPacket)
 {
-    auto wcaPacket = packet->peekAtFront<WcaPacket>();
     auto srcAddr = wcaPacket->getSourceAddress();
 
     if (srcAddr == myAddress)
@@ -358,48 +357,324 @@ void Wca::processHelloPacket(Packet *packet)
 void Wca::performClusterElection()
 {
     myWeight = calculateWeight();
-    bool shouldBeClusterHead = true;
 
-    // Check if any neighbor has lower weight
+    EV_INFO << "=== Node " << myNodeId << " cluster election ===" << endl;
+    EV_INFO << "  My weight: " << myWeight << ", Neighbors: " << neighbors.size() << endl;
+
+    // If no neighbors, node must be CH (beware: isolated node)
+    if (neighbors.empty()) {
+        if (!isClusterHead) {
+            EV_INFO << "  -> No neighbors, becoming standalone CH" << endl;
+            becomeClusterHead();
+            emit(clusterHeadChangedSignal, true);
+        }
+        return;
+    }
+
+    // Find if there's an existing CH neighbor with lower weight than me
+    Ipv4Address bestNeighborCH;
+    double bestNeighborCHWeight = DBL_MAX;
+
+    // Find the neighbor with lowest weight (whether CH or not)
+    Ipv4Address lowestWeightNeighbor;
+    double lowestNeighborWeight = DBL_MAX;
+
     for (const auto& pair : neighbors) {
-        if (pair.second.weight < myWeight) {
-            shouldBeClusterHead = false;
-            break;
+        EV_DEBUG << "  Neighbor " << pair.first << ": weight=" << pair.second.weight
+                 << ", isCH=" << pair.second.isClusterHead << endl;
+
+        // Track best existing CH neighbor
+        if (pair.second.isClusterHead && pair.second.weight < bestNeighborCHWeight) {
+            bestNeighborCHWeight = pair.second.weight;
+            bestNeighborCH = pair.first;
+        }
+
+        // Track lowest weight neighbor overall
+        if (pair.second.weight < lowestNeighborWeight) {
+            lowestNeighborWeight = pair.second.weight;
+            lowestWeightNeighbor = pair.first;
+        }
+        else if (pair.second.weight == lowestNeighborWeight && pair.first < lowestWeightNeighbor) {
+            lowestWeightNeighbor = pair.first;
         }
     }
 
-    // If no neighbors, become cluster head by default
-    if (neighbors.empty()) {
-        EV_INFO << "Node " << myAddress << " has no neighbors, becoming isolated CH\n";
-        shouldBeClusterHead = true;
+    // Determine if I should be CH
+    bool shouldBeClusterHead = true;
+
+
+    if (lowestNeighborWeight < myWeight) {
+        shouldBeClusterHead = false;
+    }
+    else if (lowestNeighborWeight == myWeight && lowestWeightNeighbor < myAddress) {
+        shouldBeClusterHead = false;
     }
 
-    if (shouldBeClusterHead && !isClusterHead) {
-        becomeClusterHead();
+    bool wasClusterHead = isClusterHead;
+
+    if (shouldBeClusterHead) {
+        if (!isClusterHead) {
+            EV_INFO << "  -> Becoming Cluster Head (lowest weight)" << endl;
+            becomeClusterHead();
+        } else {
+            EV_INFO << "  -> Remain CH with " << clusterMembers.size() << " members" << endl;
+        }
     }
-    else if (!shouldBeClusterHead && isClusterHead) {
-        isClusterHead = false;
-        clusterMembers.clear();
-        emit(clusterHeadChangedSignal, false);
+    else {
+        // I should NOT be CH - but only step down if there's an EXISTING CH to join
+        // OR if the lower-weight neighbor is already a CH
 
-        // Find best cluster head to join
-        Ipv4Address bestCH;
-        double minWeight = myWeight;
+        bool canStepDown = false;
+        Ipv4Address chToJoin;
 
-        for (const auto& pair : neighbors) {
-            if (pair.second.weight < minWeight) {
-                minWeight = pair.second.weight;
-                bestCH = pair.first;
+        // there's an existing CH neighbor
+        if (!bestNeighborCH.isUnspecified()) {
+            canStepDown = true;
+            chToJoin = bestNeighborCH;
+            EV_DEBUG << "  Can step down: existing CH " << bestNeighborCH << endl;
+        }
+        // The lowest weight neighbor is already a CH
+        else if (!lowestWeightNeighbor.isUnspecified()) {
+            auto it = neighbors.find(lowestWeightNeighbor);
+            if (it != neighbors.end() && it->second.isClusterHead) {
+                canStepDown = true;
+                chToJoin = lowestWeightNeighbor;
+                EV_DEBUG << "  Can step down: lowest weight neighbor " << lowestWeightNeighbor << " is CH" << endl;
             }
         }
 
-        if (!bestCH.isUnspecified()) {
-            joinCluster(bestCH);
+        if (isClusterHead) {
+            if (canStepDown) {
+                // Safe to step down - there's a CH to join
+                EV_INFO << "  -> Stepping down from CH, joining " << chToJoin << endl;
+                stepDownFromClusterHead();
+                joinCluster(chToJoin);
+            } else {
+                // NOT safe to step down - remain CH until a better CH emerges
+                EV_INFO << "  -> Should step down but no CH available, remaining CH" << endl;
+                // Stay as CH - don't leave network without a CH!
+            }
+        }
+        else {
+            // I'm not CH - find a cluster to join
+            if (!bestNeighborCH.isUnspecified()) {
+                if (myClusterHead != bestNeighborCH) {
+                    joinCluster(bestNeighborCH);
+                }
+            } else {
+                // No CH neighbor - use findAndJoinBestCluster which will make me CH if needed
+                findAndJoinBestCluster();
+            }
         }
     }
-    else if (shouldBeClusterHead && isClusterHead) {
-        std::vector<int> chList;
-        chList.push_back(getContainingNode(this)->getIndex());
+
+    if (wasClusterHead != isClusterHead) {
+        emit(clusterHeadChangedSignal, isClusterHead);
+    }
+}
+
+void Wca::becomeClusterHead()
+{
+    isClusterHead = true;
+    myClusterHead = myAddress;
+    clusterMembers.clear();
+
+    // Track when this CH period started
+    lastCHStartTime = simTime();
+
+    EV_INFO << "Node " << myNodeId << " became cluster head (total CH time: "
+            << cumulativeCHTime << "s)" << endl;
+
+    metricsLogger->logBecomeCH(simTime());
+
+    cModule *host = getContainingNode(this);
+    host->bubble("CH!");
+
+    Packet *packet = new Packet("WCA-CH-ANNOUNCE");
+    const auto& announce = makeShared<WcaPacket>();
+
+    announce->setPacketType(WcaPacketType::CLUSTER_HEAD_ANNOUNCEMENT);
+    announce->setSourceAddress(myAddress);
+    announce->setDestAddress(Ipv4Address::ALLONES_ADDRESS);
+    announce->setClusterHeadAddress(myAddress);
+    announce->setWeight(myWeight);
+    announce->setIsClusterHead(true);
+    announce->setChunkLength(B(32));
+
+    packet->insertAtBack(announce);
+    sendPacket(packet, Ipv4Address::ALLONES_ADDRESS);
+}
+
+void Wca::stepDownFromClusterHead()
+{
+    // Accumulate CH time before stepping down
+    if (lastCHStartTime > 0) {
+        cumulativeCHTime += (simTime() - lastCHStartTime);
+        EV_INFO << "Node " << myNodeId << " stepping down, was CH for "
+                << (simTime() - lastCHStartTime) << "s (total: " << cumulativeCHTime << "s)" << endl;
+    }
+    lastCHStartTime = 0;
+
+    metricsLogger->logStopCH(simTime());
+    metricsLogger->logCHReselection(simTime());
+
+    isClusterHead = false;
+    clusterMembers.clear();
+    myClusterHead = Ipv4Address::UNSPECIFIED_ADDRESS;
+
+    cModule *host = getContainingNode(this);
+    host->getDisplayString().setTagArg("i", 1, "");
+}
+
+void Wca::findAndJoinBestCluster()
+{
+    Ipv4Address bestCH;
+    double bestWeight = DBL_MAX;
+
+    // Look for existing cluster heads among neighbors first
+    for (const auto& pair : neighbors) {
+        if (pair.second.isClusterHead && pair.second.weight < bestWeight) {
+            bestWeight = pair.second.weight;
+            bestCH = pair.first;
+        }
+    }
+
+    // If found a CH neighbor, join it
+    if (!bestCH.isUnspecified()) {
+        joinCluster(bestCH);
+        return;
+    }
+
+    // No CH neighbor found - check if I should become CH
+    bool iHaveLowestWeight = true;
+    bestWeight = DBL_MAX;
+
+    for (const auto& pair : neighbors) {
+        if (pair.second.weight < myWeight) {
+            iHaveLowestWeight = false;
+        }
+        else if (pair.second.weight == myWeight && pair.first < myAddress) {
+            iHaveLowestWeight = false;
+        }
+
+        // Track lowest weight neighbor
+        if (pair.second.weight < bestWeight) {
+            bestWeight = pair.second.weight;
+            bestCH = pair.first;
+        }
+    }
+
+    if (neighbors.empty()) {
+        // Isolated node - become CH
+        EV_INFO << "Node " << myNodeId << ": Isolated, becoming standalone CH" << endl;
+        becomeClusterHead();
+    }
+    else if (iHaveLowestWeight) {
+        // I have lowest weight - I should be CH
+        EV_INFO << "Node " << myNodeId << ": Lowest weight among neighbors, becoming CH" << endl;
+        becomeClusterHead();
+    }
+    else if (!bestCH.isUnspecified()) {
+        // Join lowest weight neighbor
+        joinCluster(bestCH);
+    }
+    else {
+        // Fallback - become CH to ensure there's always one
+        EV_INFO << "Node " << myNodeId << ": Fallback, becoming CH" << endl;
+        becomeClusterHead();
+    }
+}
+
+void Wca::joinCluster(const Ipv4Address& chAddress)
+{
+    myClusterHead = chAddress;
+
+    EV_INFO << "Node " << myNodeId << " joining cluster headed by " << chAddress << endl;
+
+    Packet *packet = new Packet("WCA-JOIN-REQ");
+    const auto& joinReq = makeShared<WcaPacket>();
+
+    joinReq->setPacketType(WcaPacketType::JOIN_REQUEST);
+    joinReq->setSourceAddress(myAddress);
+    joinReq->setDestAddress(chAddress);
+    joinReq->setClusterHeadAddress(chAddress);
+    joinReq->setChunkLength(B(32));
+
+    packet->insertAtBack(joinReq);
+    sendPacket(packet, chAddress);
+
+    updateVisualization();
+}
+
+void Wca::processCHAnnouncement(const Ptr<const WcaPacket>& wcaPacket)
+{
+    auto chAddr = wcaPacket->getClusterHeadAddress();
+    double chWeight = wcaPacket->getWeight();
+
+    // Update neighbor info to mark them as CH
+    auto it = neighbors.find(chAddr);
+    if (it != neighbors.end()) {
+        it->second.isClusterHead = true;
+        it->second.clusterHeadAddress = chAddr;
+        it->second.weight = chWeight;
+    }
+
+    if (isClusterHead) {
+        // I'm a CH - Only step down if the new CH has lower weight AND is my neighbor
+        if (it != neighbors.end() && chWeight < myWeight) {
+            EV_INFO << "Node " << myNodeId << ": Received CH announcement from " << chAddr
+                    << " with lower weight (" << chWeight << " < " << myWeight << "), stepping down" << endl;
+            stepDownFromClusterHead();
+            joinCluster(chAddr);
+        }
+        // Tie-breaker: lower IP wins
+        else if (it != neighbors.end() && chWeight == myWeight && chAddr < myAddress) {
+            EV_INFO << "Node " << myNodeId << ": Received CH announcement from " << chAddr
+                    << " with same weight but lower IP, stepping down" << endl;
+            stepDownFromClusterHead();
+            joinCluster(chAddr);
+        }
+    }
+    else {
+        // I'm not a CH
+        bool shouldJoin = myClusterHead.isUnspecified();
+
+        if (!shouldJoin && myClusterHead != chAddr) {
+            auto currentCHIt = neighbors.find(myClusterHead);
+            // Join new CH if: current CH is gone OR new CH has lower weight
+            if (currentCHIt == neighbors.end() || !currentCHIt->second.isClusterHead ||
+                chWeight < currentCHIt->second.weight) {
+                shouldJoin = true;
+            }
+        }
+
+        if (shouldJoin) {
+            joinCluster(chAddr);
+        }
+    }
+}
+
+void Wca::processJoinRequest(const Ptr<const WcaPacket>& wcaPacket)
+{
+    if (!isClusterHead) return;
+
+    auto memberAddr = wcaPacket->getSourceAddress();
+
+    clusterMembers.insert(memberAddr);
+
+    EV_INFO << "Node " << memberAddr << " joined cluster (" << clusterMembers.size() << " members)" << endl;
+
+    Packet *replyPacket = new Packet("WCA-JOIN-REPLY");
+    const auto& joinReply = makeShared<WcaPacket>();
+
+    joinReply->setPacketType(WcaPacketType::JOIN_REPLY);
+    joinReply->setSourceAddress(myAddress);
+    joinReply->setDestAddress(memberAddr);
+    joinReply->setClusterHeadAddress(myAddress);
+    joinReply->setChunkLength(B(32));
+
+    replyPacket->insertAtBack(joinReply);
+    sendPacket(replyPacket, memberAddr);
 
     updateVisualization();
 }
