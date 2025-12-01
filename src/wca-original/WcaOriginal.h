@@ -10,6 +10,7 @@
 #include "inet/power/contract/IEpEnergyStorage.h"
 #include <map>
 #include <set>
+#include "inet/networklayer/contract/INetfilter.h"
 #include "WcaPacket_m.h"
 #include "WcaMetricsLogger.h"
 
@@ -65,7 +66,18 @@ class INET_API Wca : public cSimpleModule, public NetfilterBase::HookBase
 
     std::map<Ipv4Address, NeighborInfo> neighbors;
     std::set<Ipv4Address> clusterMembers;
-    double myWeight;
+
+    cMessage *helloTimer = nullptr;
+    cMessage *clusterTimer = nullptr;
+    cMessage *metricTimer = nullptr;
+
+    IInterfaceTable *interfaceTable = nullptr;
+    IIpv4RoutingTable *routingTable = nullptr;
+    NetworkInterface *interface80211 = nullptr;
+    IMobility *mobility = nullptr;
+    power::IEpEnergyStorage *energyStorage = nullptr;
+    INetfilter *networkProtocol = nullptr;
+
     Coord previousPosition;
     simtime_t lastMobilityUpdate;
 

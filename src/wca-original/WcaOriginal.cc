@@ -15,6 +15,10 @@ Define_Module(Wca);
 
 Wca::~Wca()
 {
+    // Unregister from netfilter before cleanup
+    if (networkProtocol)
+        networkProtocol->unregisterHook(this);
+
     cancelAndDelete(helloTimer);
     cancelAndDelete(clusterTimer);
     cancelAndDelete(metricTimer);
@@ -74,6 +78,9 @@ void Wca::initialize(int stage)
 
         // Initialize signal
         clusterHeadChangedSignal = registerSignal("clusterHeadChanged");
+        weightSignal = registerSignal("nodeWeight");
+        neighborCountSignal = registerSignal("neighborCount");
+
         // Get canvas for visualization (from the network, not the host)
         cModule *network = getContainingNode(this)->getParentModule();
         canvas = network->getCanvas();
@@ -115,6 +122,9 @@ void Wca::initialize(int stage)
         // Register netfilter hook
         INetfilter *netfilter = getModuleFromPar<INetfilter>(par("networkProtocolModule"), this);
         netfilter->registerHook(0, this);
+        networkProtocol = getModuleFromPar<INetfilter>(par("networkProtocolModule"), this);
+        networkProtocol->registerHook(0, this);
+
 
         // Calculate initial weight
         myWeight = calculateWeight();
@@ -123,7 +133,20 @@ void Wca::initialize(int stage)
         // Schedule first hello with random offset to avoid collisions
         scheduleAt(simTime() + uniform(0, 0.1), helloTimer);
         scheduleAt(simTime() + clusterTimeout, clusterTimer);
-        scheduleAt(simTime() + 10.0, metricTimer);
+        scheduleAt(simTime() + 5.0, metricTimer);  // Start logging at 5s
+
+        // Beware that at startup, every node initially becomes a standalone clusterhead
+        isClusterHead = true;
+        myClusterHead = myAddress;
+        lastCHStartTime = simTime();
+        metricsLogger->logBecomeCH(simTime());
+        EV_INFO << "Node " << myNodeId << " starting as initial CH" << endl;
+    }
+}
+
+
+
+
 void Wca::updateVisualization()
 {
     Enter_Method_Silent();
@@ -390,10 +413,16 @@ void Wca::performClusterElection()
         std::vector<int> chList;
         chList.push_back(getContainingNode(this)->getIndex());
 
-        metricsLogger->logClusterFormation(1, chList);
-        EV_INFO << "Node " << getContainingNode(this)->getIndex()
-                << " remains CH with " << clusterMembers.size() << " members\n";
-    }
+    updateVisualization();
+}
+
+void Wca::processJoinReply(const Ptr<const WcaPacket>& wcaPacket)
+{
+    myClusterHead = wcaPacket->getClusterHeadAddress();
+
+    EV_INFO << "Node " << myNodeId << ": Join confirmed by CH " << myClusterHead << endl;
+
+    updateVisualization();
 }
 
 double Wca::calculateWeight()
