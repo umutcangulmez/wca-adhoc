@@ -15,6 +15,7 @@
 
 namespace hwca {
 
+using namespace omnetpp;
 using namespace inet;
 
 struct NeighborInfo {
@@ -27,28 +28,11 @@ struct NeighborInfo {
     bool isClusterHead;
     Ipv4Address clusterHeadAddress;
     simtime_t lastSeen;
-    Coord position;
-    Coord previousPosition;
-
-    // Constructor with default values
-    NeighborInfo() : weight(0), nodeDegree(0), transmissionPower(0),
-                     mobility(0), batteryPower(0), isClusterHead(false),
-                     lastSeen(0) {}
 };
 
-class INET_API Wca : public cSimpleModule, public NetfilterBase::HookBase
+class Wca : public cSimpleModule, public NetfilterBase::HookBase
 {
-  private:
-    // Module references
-    IInterfaceTable *interfaceTable = nullptr;
-    IIpv4RoutingTable *routingTable = nullptr;
-    IMobility *mobility = nullptr;
-    power::IEpEnergyStorage *energyStorage = nullptr;
-
-    // Network interface
-    NetworkInterface *interface80211 = nullptr;
-
-    // Parameters
+  protected:
     double helloInterval;
     double clusterTimeout;
     double maxTransmissionPower;
@@ -106,21 +90,26 @@ class INET_API Wca : public cSimpleModule, public NetfilterBase::HookBase
     virtual void handleMessage(cMessage *msg) override;
     virtual void finish() override;
 
-    // Packet processing
-    virtual void processHelloPacket(Packet *packet);
-    virtual void processCHAnnouncement(Packet *packet);
-    virtual void processJoinRequest(Packet *packet);
-    virtual void processJoinReply(Packet *packet);
+    void sendHelloPacket();
+    void processHelloPacket(const Ptr<const WcaPacket>& wcaPacket);
+    void performClusterElection();
+    void becomeClusterHead();
+    void stepDownFromClusterHead();
+    void joinCluster(const Ipv4Address& chAddress);
+    void findAndJoinBestCluster();
+    void processCHAnnouncement(const Ptr<const WcaPacket>& wcaPacket);
+    void processJoinRequest(const Ptr<const WcaPacket>& wcaPacket);
+    void processJoinReply(const Ptr<const WcaPacket>& wcaPacket);
+    void processWcaPacket(Packet *packet, const Ptr<const WcaPacket>& wcaPacket);
 
-    // Timer handlers
-    virtual void sendHelloPacket();
-    virtual void performClusterElection();
+    double calculateWeight();
+    double calculateMobility();
+    double getSumOfDistances();
+    double getCumulativeCHTime();
+    int getNodeDegree();
 
-    // WCA algorithm
-    virtual double calculateWeight();
-    virtual double calculateMobility();
-    virtual double getBatteryLevel();
-    virtual int getNodeDegree();
+    void updateNeighborInfo(const Ptr<const WcaPacket>& wcaPacket, const Ipv4Address& senderAddr);
+    void removeStaleNeighbors();
 
     // Helper functions
     virtual void updateNeighborInfo(const Ptr<const WcaPacket>& wcaPacket, const Ipv4Address& senderAddr);
@@ -138,6 +127,12 @@ class INET_API Wca : public cSimpleModule, public NetfilterBase::HookBase
 
   public:
     virtual ~Wca();
+
+    virtual Result datagramPreRoutingHook(Packet *datagram) override;
+    virtual Result datagramForwardHook(Packet *datagram) override { return ACCEPT; }
+    virtual Result datagramPostRoutingHook(Packet *datagram) override { return ACCEPT; }
+    virtual Result datagramLocalInHook(Packet *datagram) override { return ACCEPT; }
+    virtual Result datagramLocalOutHook(Packet *datagram) override { return ACCEPT; }
 };
 
 } // namespace hwca

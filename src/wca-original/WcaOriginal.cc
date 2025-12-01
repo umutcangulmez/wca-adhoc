@@ -302,8 +302,15 @@ void Wca::handleMessage(cMessage *msg)
             scheduleAt(simTime() + clusterTimeout, clusterTimer);
         }
         else if (msg == metricTimer) {
+            if (energyStorage) {
+                double currentEnergy = energyStorage->getResidualEnergyCapacity().get();
+                metricsLogger->logEnergy(currentEnergy, simTime());
+            }
+
             metricsLogger->calculateAndLogMetrics(simTime());
-            scheduleAt(simTime() + 10.0, msg);
+            emit(weightSignal, myWeight);
+            emit(neighborCountSignal, (long)neighbors.size());
+            scheduleAt(simTime() + 5.0, msg);  // Log every 5 seconds for better resolution
         }
     }
     else {
@@ -690,22 +697,25 @@ void Wca::processJoinReply(const Ptr<const WcaPacket>& wcaPacket)
 
 double Wca::calculateWeight()
 {
-    double degree = getNodeDegree();
-    double txPower = maxTransmissionPower;
+    // Original WCA formula from Chatterjee, Das, Turgut (2002):
+    int degree = getNodeDegree();
+    double sumDistances = getSumOfDistances();
     double mob = calculateMobility();
-    double battery = getBatteryLevel();
+    double chTime = getCumulativeCHTime();
 
-    // Normalize values
-    double normDegree = degree / 10.0;  // Assume max 10 neighbors todo retrieve this from params
-    double normTxPower = txPower / maxTransmissionPower;
-    double normMobility = std::min(mob / 10.0, 1.0);  // Assume max 10 m/s todo retrieve this from params
-    double normBattery = battery;
+    double degreeDiff = std::abs(degree - idealDegree);
 
-    // Calculate weighted sum (lower is better)
-    double weight = degreeWeight * (1.0 - normDegree) +
-                    transmissionWeight * normTxPower +
+    // Normalize factors to [0, ]
+    double normDegreeDiff = std::min(degreeDiff / (double)idealDegree, 1.0);
+    double normSumDistances = std::min(sumDistances / (radioRange * idealDegree), 1.0);
+    double normMobility = std::min(mob / 20.0, 1.0);
+    double normCHTime = std::min(chTime / 100.0, 1.0);
+
+    // Lower weight = better CH candidate
+    double weight = degreeWeight * normDegreeDiff +
+                    distanceWeight * normSumDistances +
                     mobilityWeight * normMobility +
-                    batteryWeight * (1.0 - normBattery);
+                    clusterHeadTimeWeight * normCHTime;
 
     return weight;
 }
@@ -724,22 +734,43 @@ double Wca::calculateMobility()
     return speed;
 }
 
-double Wca::getBatteryLevel()
+double Wca::getSumOfDistances()
 {
-    if (energyStorage) {
-        double currentEnergy = energyStorage->getResidualEnergyCapacity().get();
-        double nominalEnergy = energyStorage->getNominalEnergyCapacity().get();
-        double consumed = nominalEnergy - currentEnergy;
+    if (!mobility || neighbors.empty()) return 0.0;
 
-        static simtime_t lastEnergyLog = 0;
-        if (simTime() - lastEnergyLog > 5.0) {  // Log every 5 seconds
-            metricsLogger->logEnergyConsumption(getContainingNode(this)->getIndex(), consumed);
-            lastEnergyLog = simTime();
-        }
+    Coord myPos = mobility->getCurrentPosition();
+    double totalDistance = 0.0;
 
-        return currentEnergy / nominalEnergy;
+    cModule *network = getContainingNode(this)->getParentModule();
+
+    for (const auto& pair : neighbors) {
+        int neighborId = getNodeIdFromAddress(pair.first);
+        if (neighborId < 0) continue;
+
+        cModule *neighborHost = network->getSubmodule("host", neighborId);
+        if (!neighborHost) continue;
+
+        IMobility *neighborMobility = dynamic_cast<IMobility*>(
+            neighborHost->getSubmodule("mobility"));
+        if (!neighborMobility) continue;
+
+        Coord neighborPos = neighborMobility->getCurrentPosition();
+        totalDistance += myPos.distance(neighborPos);
     }
-    return 1.0;  // Full battery if no energy model
+
+    return totalDistance;
+}
+
+double Wca::getCumulativeCHTime()
+{
+    double totalTime = cumulativeCHTime.dbl();
+
+    // Add current CH period if currently a CH
+    if (isClusterHead && lastCHStartTime > 0) {
+        totalTime += (simTime() - lastCHStartTime).dbl();
+    }
+
+    return totalTime;
 }
 
 int Wca::getNodeDegree()
@@ -774,105 +805,21 @@ void Wca::removeStaleNeighbors()
     }
 }
 
-void Wca::becomeClusterHead()
-{
-    isClusterHead = true;
-    myClusterHead = myAddress;
-    emit(clusterHeadChangedSignal, true);
-
-    EV_INFO << "Node " << myAddress << " became cluster head\n";
-
-    // Send announcement
-    Packet *packet = new Packet("WCA-CH-ANNOUNCE");
-    const auto& announce = makeShared<WcaPacket>();
-
-    announce->setPacketType(WcaPacketType::CLUSTER_HEAD_ANNOUNCEMENT);
-    announce->setSourceAddress(myAddress);
-    announce->setDestAddress(Ipv4Address::ALLONES_ADDRESS);
-    announce->setClusterHeadAddress(myAddress);
-    announce->setIsClusterHead(true);
-    announce->setChunkLength(B(32));
-
-    packet->insertAtBack(announce);
-    sendPacket(packet, Ipv4Address::ALLONES_ADDRESS);
-}
-
-void Wca::joinCluster(const Ipv4Address& chAddress)
-{
-    myClusterHead = chAddress;
-
-    EV_INFO << "Node " << myAddress << " joining cluster headed by " << chAddress << "\n";
-
-    // Send join request
-    Packet *packet = new Packet("WCA-JOIN-REQ");
-    const auto& joinReq = makeShared<WcaPacket>();
-
-    joinReq->setPacketType(WcaPacketType::JOIN_REQUEST);
-    joinReq->setSourceAddress(myAddress);
-    joinReq->setDestAddress(chAddress);
-    joinReq->setClusterHeadAddress(chAddress);
-    joinReq->setChunkLength(B(32));
-
-    packet->insertAtBack(joinReq);
-    sendPacket(packet, chAddress);
-}
-
-void Wca::processCHAnnouncement(Packet *packet)
-{
-    auto wcaPacket = packet->peekAtFront<WcaPacket>();
-    auto chAddr = wcaPacket->getClusterHeadAddress();
-
-    if (!isClusterHead && myClusterHead.isUnspecified()) {
-        joinCluster(chAddr);
-    }
-}
-
-void Wca::processJoinRequest(Packet *packet)
-{
-    if (!isClusterHead)
-        return;
-
-    auto wcaPacket = packet->peekAtFront<WcaPacket>();
-    auto memberAddr = wcaPacket->getSourceAddress();
-
-    clusterMembers.insert(memberAddr);
-
-    EV_INFO << "Node " << memberAddr << " joined cluster\n";
-
-    // Send join reply
-    Packet *replyPacket = new Packet("WCA-JOIN-REPLY");
-    const auto& joinReply = makeShared<WcaPacket>();
-
-    joinReply->setPacketType(WcaPacketType::JOIN_REPLY);
-    joinReply->setSourceAddress(myAddress);
-    joinReply->setDestAddress(memberAddr);
-    joinReply->setClusterHeadAddress(myAddress);
-    joinReply->setChunkLength(B(32));
-
-    replyPacket->insertAtBack(joinReply);
-    sendPacket(replyPacket, memberAddr);
-}
-
-void Wca::processJoinReply(Packet *packet)
-{
-    auto wcaPacket = packet->peekAtFront<WcaPacket>();
-    myClusterHead = wcaPacket->getClusterHeadAddress();
-
-    EV_INFO << "Join confirmed by cluster head " << myClusterHead << "\n";
-}
 
 void Wca::sendPacket(Packet *packet, const Ipv4Address& destAddr)
 {
-    Enter_Method_Silent();
-    take(packet);
+    Enter_Method("sendPacket");
+
+    if (packet->getOwner() != this)
+        take(packet);
 
     // Assign packet ID for metrics
     int packetId = packetIdCounter++;
 
-    // Log sent packet
-    metricsLogger->logPacketSent(packetId, getContainingNode(this)->getIndex(), destAddr.getInt(), simTime());
+	// Log sent packet
+    metricsLogger->logPacketSent(packetId, myNodeId, destAddr.getInt(), simTime());
 
-    // Initialize hopCount if missing
+	// Initialize hopCount if missing
     if (!packet->hasPar("hopCount"))
         packet->addPar("hopCount") = 0;
 
@@ -912,30 +859,43 @@ INetfilter::IHook::Result Wca::datagramPreRoutingHook(Packet *packet)
     return ACCEPT;
 }
 
-void Wca::forwardDataPacket(Packet *packet, int packetId)
+void Wca::processWcaPacket(Packet *packet, const Ptr<const WcaPacket>& wcaPacket)
 {
-    Enter_Method_Silent();
-    take(packet);
+    Enter_Method("processWcaPacket");
+
+    switch (wcaPacket->getPacketType()) {
+        case WcaPacketType::HELLO:
+            processHelloPacket(wcaPacket);
+            metricsLogger->logRoutingOverhead(1);
+            break;
+        case WcaPacketType::CLUSTER_HEAD_ANNOUNCEMENT:
+            processCHAnnouncement(wcaPacket);
+            metricsLogger->logRoutingOverhead(1);
+            break;
+        case WcaPacketType::JOIN_REQUEST:
+            processJoinRequest(wcaPacket);
+            metricsLogger->logRoutingOverhead(1);
+            break;
+        case WcaPacketType::JOIN_REPLY:
+            processJoinReply(wcaPacket);
+            metricsLogger->logRoutingOverhead(1);
+            break;
+        default:
+            EV_WARN << "Unknown WCA packet type" << endl;
+            break;
+    }
+}
+
+void Wca::forwardDataPacket(Packet *packet)
+{
+    Enter_Method("forwardDataPacket");
 
     auto ipv4Header = packet->peekAtFront<Ipv4Header>();
     Ipv4Address dest = ipv4Header->getDestAddress();
     Ipv4Address source = ipv4Header->getSrcAddress();
     Ipv4Address nextHop;
 
-    // Initialize hop count if it doesn't exist
-    int hopCount = 0;
-    if (packet->hasPar("hopCount")) {
-        hopCount = packet->par("hopCount").longValue();
-    } else {
-        packet->addPar("hopCount") = 0;
-    }
-
-    if (dest == myAddress) {
-        EV_INFO << "Packet reached destination " << myAddress << "\n";
-        metricsLogger->logPacketReceived(packetId, getContainingNode(this)->getIndex(), simTime(), hopCount);
-        delete packet;
-        return;
-    }
+    int packetId = packetIdCounter++;
 
     // If destination is a direct neighbor, send directly
     if (neighbors.find(dest) != neighbors.end()) {
