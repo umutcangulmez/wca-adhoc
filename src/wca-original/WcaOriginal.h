@@ -76,11 +76,12 @@ class INET_API Wca : public cSimpleModule, public NetfilterBase::HookBase
     // Statistics
     simsignal_t clusterHeadChangedSignal;
 
-    // Logger
-    WCAMetricsLogger* metricsLogger;
-    cMessage *metricTimer;
-    int packetIdCounter;
-    std::map<int, simtime_t> packetSendTimes;
+    // Visualization
+    cCanvas *canvas = nullptr;
+    cOvalFigure *clusterMarker = nullptr;
+    cTextFigure *weightText = nullptr;
+    cTextFigure *statusText = nullptr;
+    std::map<Ipv4Address, cLineFigure*> connectionLines;
 
   protected:
     virtual int numInitStages() const override { return NUM_INIT_STAGES; }
@@ -111,15 +112,12 @@ class INET_API Wca : public cSimpleModule, public NetfilterBase::HookBase
     virtual void becomeClusterHead();
     virtual void joinCluster(const Ipv4Address& chAddress);
 
-    // NetFilter hook
-    virtual Result datagramPreRoutingHook(Packet *packet) override;
-    virtual Result datagramForwardHook(Packet *packet) override { return ACCEPT; }
-    virtual Result datagramPostRoutingHook(Packet *packet) override { return ACCEPT; }
-    virtual Result datagramLocalInHook(Packet *packet) override { return ACCEPT; }
-    virtual Result datagramLocalOutHook(Packet *packet) override { return ACCEPT; }
-
-    // Forwarding helper for data packets
-    void forwardDataPacket(Packet *packet, int packetId);
+    // Visualization
+    void initializeVisualization();
+    void updateVisualization();
+    void updateConnectionLines();
+    void drawConnectionLine(const Ipv4Address& targetAddr, const char* color, int width);
+    int getNodeIdFromAddress(const Ipv4Address& addr);
 
   public:
     Wca() {}

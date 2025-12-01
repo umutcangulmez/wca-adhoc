@@ -18,6 +18,24 @@ Wca::~Wca()
     cancelAndDelete(helloTimer);
     cancelAndDelete(clusterTimer);
     cancelAndDelete(metricTimer);
+
+    // Clean up visualization figures
+    if (clusterMarker && canvas) {
+        canvas->removeFigure(clusterMarker);
+        delete clusterMarker;
+    }
+    for (auto& pair : connectionLines) {
+        if (canvas) canvas->removeFigure(pair.second);
+        delete pair.second;
+    }
+    if (weightText && canvas) {
+        canvas->removeFigure(weightText);
+        delete weightText;
+    }
+    if (statusText && canvas) {
+        canvas->removeFigure(statusText);
+        delete statusText;
+    }
 }
 
 void Wca::initialize(int stage)
@@ -56,6 +74,14 @@ void Wca::initialize(int stage)
 
         // Initialize signal
         clusterHeadChangedSignal = registerSignal("clusterHeadChanged");
+        // Get canvas for visualization (from the network, not the host)
+        cModule *network = getContainingNode(this)->getParentModule();
+        canvas = network->getCanvas();
+
+        // Initialize visualization elements
+        clusterMarker = nullptr;
+        weightText = nullptr;
+        statusText = nullptr;
     }
     else if (stage == INITSTAGE_ROUTING_PROTOCOLS) {
         // Get module references
@@ -98,8 +124,136 @@ void Wca::initialize(int stage)
         scheduleAt(simTime() + uniform(0, 0.1), helloTimer);
         scheduleAt(simTime() + clusterTimeout, clusterTimer);
         scheduleAt(simTime() + 10.0, metricTimer);
+void Wca::updateVisualization()
+{
+    Enter_Method_Silent();
+
+    if (!canvas || !mobility) return;
+
+    cModule *host = getContainingNode(this);
+    Coord pos = mobility->getCurrentPosition();
+
+    // Update or create cluster head marker
+    if (isClusterHead) {
+        if (!clusterMarker) {
+            clusterMarker = new cOvalFigure("chMarker");
+            clusterMarker->setFilled(false);
+            clusterMarker->setLineWidth(3);
+            canvas->addFigure(clusterMarker);
+        }
+
+        double markerRadius = 25;
+        clusterMarker->setBounds(cFigure::Rectangle(
+            pos.x - markerRadius, pos.y - markerRadius,
+            markerRadius * 2, markerRadius * 2));
+        clusterMarker->setLineColor(cFigure::Color("red"));
+        clusterMarker->setVisible(true);
+
+        host->getDisplayString().setTagArg("i", 1, "red");
+    } else {
+        if (clusterMarker) {
+            clusterMarker->setVisible(false);
+        }
+        if (!myClusterHead.isUnspecified()) {
+            host->getDisplayString().setTagArg("i", 1, "green");
+        } else {
+            host->getDisplayString().setTagArg("i", 1, "");
+        }
+    }
+
+    // Update weight display text
+    if (!weightText) {
+        weightText = new cTextFigure("weightText");
+        weightText->setFont(cFigure::Font("Arial", 10));
+        weightText->setColor(cFigure::Color("blue"));
+        canvas->addFigure(weightText);
+    }
+
+    std::ostringstream oss;
+    oss << "W:" << std::fixed << std::setprecision(2) << myWeight;
+    weightText->setText(oss.str().c_str());
+    weightText->setPosition(cFigure::Point(pos.x + 15, pos.y - 20));
+
+    // Update status text (CH/Member)
+    if (!statusText) {
+        statusText = new cTextFigure("statusText");
+        canvas->addFigure(statusText);
+    }
+
+    if (isClusterHead) {
+        std::ostringstream statusOss;
+        statusOss << "CH(" << clusterMembers.size() << ")";
+        statusText->setText(statusOss.str().c_str());
+        statusText->setColor(cFigure::Color("red"));
+    } else if (!myClusterHead.isUnspecified()) {
+        std::ostringstream chOss;
+        chOss << "->N" << getNodeIdFromAddress(myClusterHead);
+        statusText->setText(chOss.str().c_str());
+        statusText->setColor(cFigure::Color("green"));
+    } else {
+        statusText->setText("?");
+        statusText->setColor(cFigure::Color("gray"));
+    }
+    statusText->setPosition(cFigure::Point(pos.x + 15, pos.y + 5));
+
+    updateConnectionLines();
+}
+
+void Wca::updateConnectionLines()
+{
+    if (!canvas || !mobility) return;
+
+    for (auto& pair : connectionLines) {
+        canvas->removeFigure(pair.second);
+        delete pair.second;
+    }
+    connectionLines.clear();
+
+    if (isClusterHead) {
+        for (const auto& memberAddr : clusterMembers) {
+            drawConnectionLine(memberAddr, "blue", 1);
+        }
+    } else if (!myClusterHead.isUnspecified()) {
+        drawConnectionLine(myClusterHead, "green", 2);
     }
 }
+
+void Wca::drawConnectionLine(const Ipv4Address& targetAddr, const char* color, int width)
+{
+    if (!canvas || !mobility) return;
+
+    int targetNodeId = getNodeIdFromAddress(targetAddr);
+    if (targetNodeId < 0) return;
+
+    cModule *network = getContainingNode(this)->getParentModule();
+    cModule *targetHost = network->getSubmodule("host", targetNodeId);
+    if (!targetHost) return;
+
+    IMobility *targetMobility = dynamic_cast<IMobility*>(targetHost->getSubmodule("mobility"));
+    if (!targetMobility) return;
+
+    Coord myPos = mobility->getCurrentPosition();
+    Coord targetPos = targetMobility->getCurrentPosition();
+
+    std::string lineName = "line_" + std::to_string(myNodeId) + "_" + std::to_string(targetNodeId);
+    cLineFigure *line = new cLineFigure(lineName.c_str());
+    line->setStart(cFigure::Point(myPos.x, myPos.y));
+    line->setEnd(cFigure::Point(targetPos.x, targetPos.y));
+    line->setLineColor(cFigure::Color(color));
+    line->setLineWidth(width);
+    line->setLineStyle(cFigure::LINE_DASHED);
+
+    canvas->addFigure(line);
+    connectionLines[targetAddr] = line;
+}
+
+int Wca::getNodeIdFromAddress(const Ipv4Address& addr)
+{
+    uint32_t ipInt = addr.getInt();
+    int nodeId = (ipInt & 0xFF) - 1;
+    return nodeId;
+}
+
 
 void Wca::handleMessage(cMessage *msg)
 {
@@ -111,6 +265,7 @@ void Wca::handleMessage(cMessage *msg)
         else if (msg == clusterTimer) {
             performClusterElection();
             removeStaleNeighbors();
+            updateVisualization();
             scheduleAt(simTime() + clusterTimeout, clusterTimer);
         }
         else if (msg == metricTimer) {
