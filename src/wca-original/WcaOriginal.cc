@@ -307,39 +307,8 @@ void Wca::handleMessage(cMessage *msg)
         }
     }
     else {
-        Packet *packet = check_and_cast<Packet *>(msg);
-        auto ipv4Header = packet->popAtFront<inet::Ipv4Header>();
-        int hopCount = 0;
-
-        const Ptr<const WcaPacket> wcaPacket = packet->peekAtFront<WcaPacket>();
-        if (!wcaPacket) {
-            metricsLogger->logPacketReceived(packetIdCounter++, getContainingNode(this)->getIndex(),
-                                             simTime(), hopCount);
-            return;
-        }
-        switch (wcaPacket->getPacketType()) {
-            case WcaPacketType::HELLO:
-                processHelloPacket(packet);
-                metricsLogger->logRoutingOverhead(1);
-                break;
-            case WcaPacketType::CLUSTER_HEAD_ANNOUNCEMENT:
-                processCHAnnouncement(packet);
-                metricsLogger->logRoutingOverhead(1);
-                break;
-            case WcaPacketType::JOIN_REQUEST:
-                processJoinRequest(packet);
-                metricsLogger->logRoutingOverhead(1);
-                break;
-            case WcaPacketType::JOIN_REPLY:
-                processJoinReply(packet);
-                metricsLogger->logRoutingOverhead(1);
-                break;
-            default:
-                EV_WARN << "Unknown packet type received\n";
-                metricsLogger->logPacketDropped(0, getContainingNode(this)->getIndex(),
-                                              "Unknown packet type", simTime());
-                break;
-        }
+        EV_WARN << "Unexpected packet received in handleMessage" << endl;
+        delete msg;
     }
 }
 
@@ -364,6 +333,10 @@ void Wca::sendHelloPacket()
 
     packet->insertAtBack(hello);
     packet->addPar("hopCount") = 0;
+
+    EV_DEBUG << "Node " << myNodeId << " sending HELLO, weight=" << myWeight
+             << ", isCH=" << isClusterHead << ", neighbors=" << neighbors.size() << endl;
+
     sendPacket(packet, Ipv4Address::ALLONES_ADDRESS);
 }
 
@@ -376,6 +349,10 @@ void Wca::processHelloPacket(Packet *packet)
         return;
 
     updateNeighborInfo(wcaPacket, srcAddr);
+
+    EV_DEBUG << "Node " << myNodeId << " received HELLO from " << srcAddr
+             << ", weight=" << wcaPacket->getWeight()
+             << ", isCH=" << wcaPacket->isClusterHead() << endl;
 }
 
 void Wca::performClusterElection()
@@ -732,10 +709,8 @@ void Wca::forwardDataPacket(Packet *packet, int packetId)
 
     // Drop packet if no route found
     if (nextHop.isUnspecified()) {
-        EV_WARN << "No route to destination " << dest << ", dropping packet\n";
-        metricsLogger->logPacketDropped(packetId, getContainingNode(this)->getIndex(),
-                                       "No route", simTime());
-        delete packet;
+        EV_WARN << "No route to " << dest << ", dropping packet" << endl;
+        metricsLogger->logPacketDropped(packetId, myNodeId, "No route", simTime());
         return;
     }
 
