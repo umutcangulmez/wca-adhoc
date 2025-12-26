@@ -22,14 +22,18 @@ simple Wca like IApp
         double radioRange @unit(m) = default(250m);
         
         // w1: Degree difference weight
-        double degreeWeight = default(0.25);
+        double degreeWeight = default(0.15);
         // w2: Sum of distances weight
-        double distanceWeight = default(0.25);
+        double distanceWeight = default(0.15);
         // w3: Mobility weight
-        double mobilityWeight = default(0.25);
+        double mobilityWeight = default(0.20);
         // w4: Cumulative CH time weight
-        double clusterHeadTimeWeight = default(0.25);
+        double clusterHeadTimeWeight = default(0.20);
 
+        // HWCA Infrastructure parameters
+        double apDistanceWeight = default(0.30);       // w5: weight for AP distance
+        double apSignalThreshold = default(-75);       // AP signal threshold in dBm
+        string apPositions = default("");              // AP positions as "x1,y1;x2,y2;..."
         // ideal number of neighbors
         int idealDegree = default(5);
         

@@ -31,6 +31,14 @@ struct NeighborInfo {
     bool isClusterHead;
     Ipv4Address clusterHeadAddress;
     simtime_t lastSeen;
+    bool hasAPConnectivity;
+
+};
+  enum class NetworkMode {
+    DIRECT_AP,       // Direct connectivity to access point
+    GATEWAY,         // Clusterhead with AP connectivity
+    CLUSTER_MEMBER,  // Connected to server through a gateway
+    DISCONNECTED     // No connectivity to server
 };
 
 class Wca : public cSimpleModule, public NetfilterBase::HookBase
@@ -43,6 +51,7 @@ class Wca : public cSimpleModule, public NetfilterBase::HookBase
     double distanceWeight;         // w2: weight for sum of distances
     double mobilityWeight;         // w3: weight for mobility
     double clusterHeadTimeWeight;  // w4: weight for cumulative CH time
+    double apDistanceWeight;         // w5: weight for AP distance
     double radioRange;
     int idealDegree;               // Ideal number of neighbors
 
@@ -86,6 +95,15 @@ class Wca : public cSimpleModule, public NetfilterBase::HookBase
     cTextFigure *weightText = nullptr;
     cTextFigure *statusText = nullptr;
     std::map<Ipv4Address, cLineFigure*> connectionLines;
+    std::vector<cOvalFigure*> apRangeCircles;  // Visual circles showing AP coverage
+
+    // HWCA Infrastructure Support
+    NetworkMode networkMode;
+    double apSignalThreshold;
+    double distanceToNearestAP;
+    bool hasAPConnectivity;
+    Ipv4Address myGateway;
+    std::vector<Coord> apPositions;
 
   protected:
     virtual int numInitStages() const override { return NUM_INIT_STAGES; }
@@ -123,6 +141,16 @@ class Wca : public cSimpleModule, public NetfilterBase::HookBase
     void updateConnectionLines();
     void drawConnectionLine(const Ipv4Address& targetAddr, const char* color, int width);
     int getNodeIdFromAddress(const Ipv4Address& addr);
+    void visualizeAPCoverage();
+
+    // HWCA Mode Selection
+    void updateNetworkMode();
+    double getDistanceToNearestAP();
+    bool checkAPConnectivity();
+    Ipv4Address findBestGateway();
+    const char* networkModeToString(NetworkMode mode);
+    void parseAPPositions(const char* apPosStr);
+    bool hasMembersOutsideAPRange();
 
   public:
     virtual ~Wca();

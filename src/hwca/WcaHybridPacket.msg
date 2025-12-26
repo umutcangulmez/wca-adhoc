@@ -35,4 +35,8 @@ class WcaPacket extends inet::FieldsChunk
     bool isClusterHead;
 
     simtime_t timestamp;
+
+    bool hasAPConnectivity = false;      // Whether sender can reach an AP
+    double distanceToAP = -1;            // Distance to nearest AP
+
 }

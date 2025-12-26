@@ -44,6 +44,11 @@ Wca::~Wca()
         canvas->removeFigure(statusText);
         delete statusText;
     }
+    for (auto* circle : apRangeCircles) {
+        if (canvas) canvas->removeFigure(circle);
+        delete circle;
+    }
+
 }
 
 void Wca::initialize(int stage)
@@ -61,6 +66,16 @@ void Wca::initialize(int stage)
         clusterHeadTimeWeight = par("clusterHeadTimeWeight");
         radioRange = par("radioRange");
         idealDegree = par("idealDegree");
+
+        // HWCA Infrastructure parameters
+        apDistanceWeight = par("apDistanceWeight");
+        apSignalThreshold = par("apSignalThreshold");
+
+        // HWCA State initialization
+        networkMode = NetworkMode::DISCONNECTED;
+        distanceToNearestAP = DBL_MAX;
+        hasAPConnectivity = false;
+        myGateway = Ipv4Address::UNSPECIFIED_ADDRESS;
 
         // Initialize state
         isClusterHead = false;
@@ -117,6 +132,21 @@ void Wca::initialize(int stage)
         mobility = check_and_cast<IMobility *>(getParentModule()->getSubmodule("mobility"));
         previousPosition = mobility->getCurrentPosition();
 
+        // Load AP positions from parameters
+        const char *apPosStr = par("apPositions").stringValue();
+        parseAPPositions(apPosStr);
+
+        // Check initial AP connectivity
+        hasAPConnectivity = checkAPConnectivity();
+        distanceToNearestAP = getDistanceToNearestAP();
+        updateNetworkMode();
+
+        EV_INFO << "Node " << myNodeId << " initial AP connectivity: "
+                << (hasAPConnectivity ? "YES" : "NO")
+                << ", distance to nearest AP: " << distanceToNearestAP << "m"
+                << ", mode: " << networkModeToString(networkMode) << endl;
+
+
         // Try to get energy storage
         cModule *host = getContainingNode(this);
         energyStorage = dynamic_cast<power::IEpEnergyStorage *>(
@@ -155,6 +185,8 @@ void Wca::initialize(int stage)
         lastCHStartTime = simTime();
         metricsLogger->logBecomeCH(simTime());
         EV_INFO << "Node " << myNodeId << " starting as initial CH" << endl;
+        visualizeAPCoverage();
+
     }
 }
 
@@ -211,26 +243,52 @@ void Wca::updateVisualization()
     weightText->setText(oss.str().c_str());
     weightText->setPosition(cFigure::Point(pos.x + 15, pos.y - 20));
 
-    // Update status text (CH/Member)
+	// Update status text (Network Mode + CH/Member)
     if (!statusText) {
         statusText = new cTextFigure("statusText");
         canvas->addFigure(statusText);
     }
 
-    if (isClusterHead) {
-        std::ostringstream statusOss;
-        statusOss << "CH(" << clusterMembers.size() << ")";
-        statusText->setText(statusOss.str().c_str());
-        statusText->setColor(cFigure::Color("red"));
-    } else if (!myClusterHead.isUnspecified()) {
-        std::ostringstream chOss;
-        chOss << "->N" << getNodeIdFromAddress(myClusterHead);
-        statusText->setText(chOss.str().c_str());
-        statusText->setColor(cFigure::Color("green"));
-    } else {
-        statusText->setText("?");
-        statusText->setColor(cFigure::Color("gray"));
+    std::ostringstream statusOss;
+
+    // Show network mode
+    switch (networkMode) {
+        case NetworkMode::DIRECT_AP:
+            statusOss << "[AP]";
+            statusText->setColor(cFigure::Color("blue"));
+            host->getDisplayString().setTagArg("i", 1, "blue");
+            break;
+        case NetworkMode::GATEWAY: {
+            int outsideMembers = 0;
+            for (const auto& memberAddr : clusterMembers) {
+                auto it = neighbors.find(memberAddr);
+                if (it != neighbors.end() && !it->second.hasAPConnectivity) {
+                    outsideMembers++;
+                }
+            }
+            statusOss << "[GW:" << outsideMembers << "]";
+            statusText->setColor(cFigure::Color("purple"));
+            host->getDisplayString().setTagArg("i", 1, "purple");
+            break;
+        }
+        case NetworkMode::CLUSTER_MEMBER:
+            statusOss << "[M->N" << getNodeIdFromAddress(myGateway) << "]";
+            statusText->setColor(cFigure::Color("green"));
+            host->getDisplayString().setTagArg("i", 1, "green");
+            break;
+        case NetworkMode::DISCONNECTED:
+            statusOss << "[DISC]";
+            statusText->setColor(cFigure::Color("red"));
+            host->getDisplayString().setTagArg("i", 1, "red");
+            break;
     }
+
+    // Add CH info if cluster head
+    if (isClusterHead) {
+        statusOss << " CH";
+    }
+
+    statusText->setText(statusOss.str().c_str());
     statusText->setPosition(cFigure::Point(pos.x + 15, pos.y + 5));
 
     updateConnectionLines();
@@ -339,6 +397,8 @@ void Wca::sendHelloPacket()
     hello->setBatteryPower(1.0);  // Not used in correct WCA
     hello->setIsClusterHead(isClusterHead);
     hello->setClusterHeadAddress(isClusterHead ? myAddress : myClusterHead);
+    hello->setHasAPConnectivity(hasAPConnectivity);
+    hello->setDistanceToAP(distanceToNearestAP);
     hello->setTimestamp(simTime());
     hello->setChunkLength(B(64));
 
@@ -360,9 +420,13 @@ void Wca::processHelloPacket(const Ptr<const WcaPacket>& wcaPacket)
 
     updateNeighborInfo(wcaPacket, srcAddr);
 
+    // Update network mode based on new neighbor info
+    updateNetworkMode();
+
     EV_DEBUG << "Node " << myNodeId << " received HELLO from " << srcAddr
              << ", weight=" << wcaPacket->getWeight()
-             << ", isCH=" << wcaPacket->isClusterHead() << endl;
+             << ", isCH=" << wcaPacket->isClusterHead()
+             << ", hasAP=" << wcaPacket->getHasAPConnectivity() << endl;
 }
 
 void Wca::performClusterElection()
@@ -482,6 +546,7 @@ void Wca::performClusterElection()
     if (wasClusterHead != isClusterHead) {
         emit(clusterHeadChangedSignal, isClusterHead);
     }
+    updateNetworkMode();
 }
 
 void Wca::becomeClusterHead()
@@ -701,25 +766,33 @@ void Wca::processJoinReply(const Ptr<const WcaPacket>& wcaPacket)
 
 double Wca::calculateWeight()
 {
-    // Original WCA formula from Chatterjee, Das, Turgut (2002):
+    // HWCA formula (extended from WCA):
+    // W = w1*Δv + w2*Dv + w3*Mv + w4*Pv + w5*Av
+
     int degree = getNodeDegree();
     double sumDistances = getSumOfDistances();
     double mob = calculateMobility();
     double chTime = getCumulativeCHTime();
+    double apDist = getDistanceToNearestAP();
 
     double degreeDiff = std::abs(degree - idealDegree);
 
-    // Normalize factors to [0, ]
+    // Normalize factors to [0, 1]
     double normDegreeDiff = std::min(degreeDiff / (double)idealDegree, 1.0);
     double normSumDistances = std::min(sumDistances / (radioRange * idealDegree), 1.0);
     double normMobility = std::min(mob / 20.0, 1.0);
     double normCHTime = std::min(chTime / 100.0, 1.0);
 
+    // Normalize AP distance: 0 = at AP, 1 = at or beyond radio range
+    double normAPDistance = std::min(apDist / radioRange, 1.0);
+
     // Lower weight = better CH candidate
+    // Nodes closer to APs get lower weight (better gateway candidates)
     double weight = degreeWeight * normDegreeDiff +
                     distanceWeight * normSumDistances +
                     mobilityWeight * normMobility +
-                    clusterHeadTimeWeight * normCHTime;
+                    clusterHeadTimeWeight * normCHTime +
+                    apDistanceWeight * normAPDistance;
 
     return weight;
 }
@@ -794,6 +867,8 @@ void Wca::updateNeighborInfo(const Ptr<const WcaPacket>& wcaPacket, const Ipv4Ad
     info.isClusterHead = wcaPacket->isClusterHead();
     info.clusterHeadAddress = wcaPacket->getClusterHeadAddress();
     info.lastSeen = simTime();
+    info.hasAPConnectivity = wcaPacket->getHasAPConnectivity();
+
 }
 
 void Wca::removeStaleNeighbors()
@@ -820,10 +895,8 @@ void Wca::sendPacket(Packet *packet, const Ipv4Address& destAddr)
     // Assign packet ID for metrics
     int packetId = packetIdCounter++;
 
-	// Log sent packet
     metricsLogger->logPacketSent(packetId, myNodeId, destAddr.getInt(), simTime());
 
-	// Initialize hopCount if missing
     if (!packet->hasPar("hopCount"))
         packet->addPar("hopCount") = 0;
 
@@ -1007,6 +1080,191 @@ void Wca::finish()
         metricsLogger->finalizeAndClose();
         delete metricsLogger;
         metricsLogger = nullptr;
+    }
+}
+void Wca::parseAPPositions(const char* apPosStr)
+{
+    apPositions.clear();
+
+    if (!apPosStr || strlen(apPosStr) == 0) {
+        EV_WARN << "No AP positions configured" << endl;
+        return;
+    }
+
+    // Parse format: "x1,y1;x2,y2;x3,y3"
+    std::string posStr(apPosStr);
+    std::stringstream ss(posStr);
+    std::string token;
+
+    while (std::getline(ss, token, ';')) {
+        size_t comma = token.find(',');
+        if (comma != std::string::npos) {
+            double x = std::stod(token.substr(0, comma));
+            double y = std::stod(token.substr(comma + 1));
+            apPositions.push_back(Coord(x, y, 0));
+            EV_INFO << "Loaded AP position: (" << x << ", " << y << ")" << endl;
+        }
+    }
+
+    EV_INFO << "Total APs configured: " << apPositions.size() << endl;
+}
+
+double Wca::getDistanceToNearestAP()
+{
+    if (apPositions.empty() || !mobility) {
+        return DBL_MAX;
+    }
+
+    Coord myPos = mobility->getCurrentPosition();
+    double minDist = DBL_MAX;
+
+    for (const auto& apPos : apPositions) {
+        double dist = myPos.distance(apPos);
+        if (dist < minDist) {
+            minDist = dist;
+        }
+    }
+
+    return minDist;
+}
+
+bool Wca::checkAPConnectivity()
+{
+    distanceToNearestAP = getDistanceToNearestAP();
+
+    // Connected if within radio range of any AP
+    // todo this would check actual signal strength
+    return distanceToNearestAP <= radioRange;
+}
+
+Ipv4Address Wca::findBestGateway()
+{
+    Ipv4Address bestGateway;
+    double bestWeight = DBL_MAX;
+
+    // Find a clusterhead neighbor with AP connectivity (true gateway)
+    for (const auto& pair : neighbors) {
+        if (pair.second.hasAPConnectivity && pair.second.isClusterHead) {
+            if (pair.second.weight < bestWeight) {
+                bestWeight = pair.second.weight;
+                bestGateway = pair.first;
+            }
+        }
+    }
+
+    if (!bestGateway.isUnspecified()) {
+        return bestGateway;
+    }
+
+    // Find any neighbor with AP connectivity (can relay)
+    bestWeight = DBL_MAX;
+    for (const auto& pair : neighbors) {
+        if (pair.second.hasAPConnectivity) {
+            if (pair.second.weight < bestWeight) {
+                bestWeight = pair.second.weight;
+                bestGateway = pair.first;
+            }
+        }
+    }
+
+    return bestGateway;
+}
+
+void Wca::updateNetworkMode()
+{
+    NetworkMode oldMode = networkMode;
+
+    hasAPConnectivity = checkAPConnectivity();
+    distanceToNearestAP = getDistanceToNearestAP();
+
+    if (hasAPConnectivity) {
+        // Node has AP access
+        if (isClusterHead && hasMembersOutsideAPRange()) {
+            // Node is a CH with members and members need gateway
+            networkMode = NetworkMode::GATEWAY;
+        }
+        else {
+            // Direct AP access, no gateway duties
+            networkMode = NetworkMode::DIRECT_AP;
+        }
+    }
+    else {
+        // No AP access, needs to find a gateway
+        Ipv4Address gateway = findBestGateway();
+        if (!gateway.isUnspecified()) {
+            networkMode = NetworkMode::CLUSTER_MEMBER;
+            myGateway = gateway;
+        }
+        else {
+            networkMode = NetworkMode::DISCONNECTED;
+            myGateway = Ipv4Address::UNSPECIFIED_ADDRESS;
+        }
+    }
+
+    if (oldMode != networkMode) {
+        EV_INFO << "Node " << myNodeId << " mode changed: "
+                << networkModeToString(oldMode) << " -> "
+                << networkModeToString(networkMode) << endl;
+    }
+}
+bool Wca::hasMembersOutsideAPRange()
+{
+    if (clusterMembers.empty()) {
+        return false;
+    }
+
+    for (const auto& memberAddr : clusterMembers) {
+        auto it = neighbors.find(memberAddr);
+        if (it != neighbors.end()) {
+            // Members doesn't have AP connectivity - needs gateway
+            if (!it->second.hasAPConnectivity) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+const char* Wca::networkModeToString(NetworkMode mode)
+{
+    switch (mode) {
+        case NetworkMode::DIRECT_AP: return "DIRECT_AP";
+        case NetworkMode::GATEWAY: return "GATEWAY";
+        case NetworkMode::CLUSTER_MEMBER: return "CLUSTER_MEMBER";
+        case NetworkMode::DISCONNECTED: return "DISCONNECTED";
+        default: return "UNKNOWN";
+    }
+}
+
+void Wca::visualizeAPCoverage()
+{
+    if (!canvas) return;
+
+
+    if (myNodeId != 0) return;
+
+    // Clear old circles
+    for (auto* circle : apRangeCircles) {
+        canvas->removeFigure(circle);
+        delete circle;
+    }
+    apRangeCircles.clear();
+
+    // Draw coverage circle for each AP
+    for (size_t i = 0; i < apPositions.size(); i++) {
+        cOvalFigure *circle = new cOvalFigure(("apRange" + std::to_string(i)).c_str());
+        circle->setBounds(cFigure::Rectangle(
+            apPositions[i].x - radioRange,
+            apPositions[i].y - radioRange,
+            radioRange * 2,
+            radioRange * 2));
+        circle->setLineColor(cFigure::Color("blue"));
+        circle->setLineWidth(2);
+        circle->setLineStyle(cFigure::LINE_DASHED);
+        circle->setFilled(false);
+        circle->setZIndex(-1);  // Draw behind nodes
+        canvas->addFigure(circle);
+        apRangeCircles.push_back(circle);
     }
 }
 
