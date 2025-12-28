@@ -26,6 +26,7 @@ Wca::~Wca()
     cancelAndDelete(helloTimer);
     cancelAndDelete(clusterTimer);
     cancelAndDelete(metricTimer);
+	cancelAndDelete(statusReportTimer);
 
     // Clean up visualization figures
     if (clusterMarker && canvas) {
@@ -90,6 +91,10 @@ void Wca::initialize(int stage)
         helloTimer = new cMessage("helloTimer");
         clusterTimer = new cMessage("clusterTimer");
         metricTimer = new cMessage("metricTimer");
+        statusReportTimer = new cMessage("statusReportTimer");
+
+        statusReportInterval = par("statusReportInterval");
+        statusSequenceNumber = 0;
 
         packetIdCounter = 0;
 
@@ -174,10 +179,22 @@ void Wca::initialize(int stage)
         myWeight = calculateWeight();
         EV_INFO << "Initial weight of node " << myAddress << " = " << myWeight << endl;
 
+		// Get server address from parameter
+        const char *serverAddrStr = par("serverAddress").stringValue();
+        if (strlen(serverAddrStr) > 0) {
+            serverAddress = Ipv4Address(serverAddrStr);
+        } else {
+            // todo default value for now
+            serverAddress = Ipv4Address("10.0.0.1");
+        }
+
+        // Schedule first status report with random offset
+
         // Schedule first hello with random offset to avoid collisions
         scheduleAt(simTime() + uniform(0, 0.1), helloTimer);
         scheduleAt(simTime() + clusterTimeout, clusterTimer);
         scheduleAt(simTime() + 5.0, metricTimer);  // Start logging at 5s
+        scheduleAt(simTime() + uniform(1.0, 2.0), statusReportTimer);
 
         // Beware that at startup, every node initially becomes a standalone clusterhead
         isClusterHead = true;
@@ -243,7 +260,7 @@ void Wca::updateVisualization()
     weightText->setText(oss.str().c_str());
     weightText->setPosition(cFigure::Point(pos.x + 15, pos.y - 20));
 
-	// Update status text (Network Mode + CH/Member)
+    // Update status text (Network Mode + CH/Member)
     if (!statusText) {
         statusText = new cTextFigure("statusText");
         canvas->addFigure(statusText);
@@ -360,6 +377,7 @@ void Wca::handleMessage(cMessage *msg)
         else if (msg == clusterTimer) {
             performClusterElection();
             removeStaleNeighbors();
+            checkGatewayHandover();
             updateVisualization();
             scheduleAt(simTime() + clusterTimeout, clusterTimer);
         }
@@ -373,6 +391,10 @@ void Wca::handleMessage(cMessage *msg)
             emit(weightSignal, myWeight);
             emit(neighborCountSignal, (long)neighbors.size());
             scheduleAt(simTime() + 5.0, msg);  // Log every 5 seconds for better resolution
+        }
+        else if (msg == statusReportTimer) {
+            sendStatusReport();
+            scheduleAt(simTime() + statusReportInterval, statusReportTimer);
         }
     }
     else {
@@ -399,6 +421,13 @@ void Wca::sendHelloPacket()
     hello->setClusterHeadAddress(isClusterHead ? myAddress : myClusterHead);
     hello->setHasAPConnectivity(hasAPConnectivity);
     hello->setDistanceToAP(distanceToNearestAP);
+
+    if (hasAPConnectivity && isClusterHead) {
+        hello->setGatewayScore(calculateGatewayScore());
+    } else {
+        hello->setGatewayScore(-1);
+    }
+
     hello->setTimestamp(simTime());
     hello->setChunkLength(B(64));
 
@@ -427,6 +456,7 @@ void Wca::processHelloPacket(const Ptr<const WcaPacket>& wcaPacket)
              << ", weight=" << wcaPacket->getWeight()
              << ", isCH=" << wcaPacket->isClusterHead()
              << ", hasAP=" << wcaPacket->getHasAPConnectivity() << endl;
+    checkGatewayHandover();
 }
 
 void Wca::performClusterElection()
@@ -546,6 +576,12 @@ void Wca::performClusterElection()
     if (wasClusterHead != isClusterHead) {
         emit(clusterHeadChangedSignal, isClusterHead);
     }
+
+    if (hasAPConnectivity && isClusterHead) {
+        triggerGatewayElection();
+    }
+
+
     updateNetworkMode();
 }
 
@@ -752,6 +788,9 @@ void Wca::processJoinRequest(const Ptr<const WcaPacket>& wcaPacket)
     replyPacket->insertAtBack(joinReply);
     sendPacket(replyPacket, memberAddr);
 
+    // Check if node become a gateway
+    updateNetworkMode();
+
     updateVisualization();
 }
 
@@ -868,6 +907,7 @@ void Wca::updateNeighborInfo(const Ptr<const WcaPacket>& wcaPacket, const Ipv4Ad
     info.clusterHeadAddress = wcaPacket->getClusterHeadAddress();
     info.lastSeen = simTime();
     info.hasAPConnectivity = wcaPacket->getHasAPConnectivity();
+    info.gatewayScore = wcaPacket->getGatewayScore();
 
 }
 
@@ -919,27 +959,42 @@ void Wca::sendPacket(Packet *packet, const Ipv4Address& destAddr)
 
 INetfilter::IHook::Result Wca::datagramPreRoutingHook(Packet *packet)
 {
-    const auto& networkHeader = packet->peekAtFront<Ipv4Header>();
+    try { // try catch added for an error in message size. todo check the issue
+        const auto& networkHeader = packet->peekAtFront<Ipv4Header>();
 
-    if (networkHeader->getProtocol() == &Protocol::manet) {
-        EV_DEBUG << "WCA packet received via netfilter hook" << endl;
+        if (networkHeader->getProtocol() == &Protocol::manet) {
+            EV_DEBUG << "WCA packet received via netfilter hook from "
+                     << networkHeader->getSrcAddress() << endl;
 
-        auto wcaPacket = packet->peekDataAt<WcaPacket>(networkHeader->getChunkLength());
-        if (wcaPacket) {
-            processWcaPacket(packet, wcaPacket);
+            try {
+                auto wcaPacket = packet->peekDataAt<WcaPacket>(networkHeader->getChunkLength());
+                if (wcaPacket) {
+                    processWcaPacket(packet, wcaPacket);
+                }
+            }
+            catch (const std::exception& e) {
+                EV_ERROR << "Failed to parse WcaPacket: " << e.what() << endl;
+            }
+
+            return DROP;
         }
+        else if (networkHeader->getProtocol() == &Protocol::udp) {
+            Ipv4Address destAddr = networkHeader->getDestAddress();
 
-        return DROP;
-    }
-    else if (networkHeader->getProtocol() == &Protocol::udp) {
-        Ipv4Address destAddr = networkHeader->getDestAddress();
+            if (destAddr == myAddress) {
+                return ACCEPT;
+            }
 
-        if (destAddr == myAddress) {
+            if (!destAddr.isLimitedBroadcastAddress()) {
+                forwardDataPacket(packet);
+                return DROP;
+            }
+
             return ACCEPT;
         }
-
-        forwardDataPacket(packet);
-        return DROP;
+    }
+    catch (const std::exception& e) {
+        EV_ERROR << "Exception in datagramPreRoutingHook: " << e.what() << endl;
     }
 
     return ACCEPT;
@@ -966,6 +1021,27 @@ void Wca::processWcaPacket(Packet *packet, const Ptr<const WcaPacket>& wcaPacket
             processJoinReply(wcaPacket);
             metricsLogger->logRoutingOverhead(1);
             break;
+		case WcaPacketType::GATEWAY_ANNOUNCE:
+            processGatewayAnnouncement(wcaPacket);
+            metricsLogger->logRoutingOverhead(1);
+            break;
+		case WcaPacketType::DATA_FORWARD:
+            processDataForward(packet, wcaPacket);
+            break;
+        case WcaPacketType::STATUS_REPORT:
+            processStatusReport(wcaPacket);
+            break;
+        case WcaPacketType::SERVER_BROADCAST:
+            processServerBroadcast(wcaPacket);
+            break;
+		case WcaPacketType::GATEWAY_DISCOVERY_REQUEST:
+            processGatewayDiscoveryRequest(wcaPacket);
+            metricsLogger->logRoutingOverhead(1);
+            break;
+        case WcaPacketType::GATEWAY_DISCOVERY_REPLY:
+            processGatewayDiscoveryReply(wcaPacket);
+            metricsLogger->logRoutingOverhead(1);
+            break;
         default:
             EV_WARN << "Unknown WCA packet type" << endl;
             break;
@@ -976,12 +1052,29 @@ void Wca::forwardDataPacket(Packet *packet)
 {
     Enter_Method("forwardDataPacket");
 
+    // Safety check todo there is an issue with size here
+    if (packet->getDataLength() < B(20)) {
+        EV_WARN << "Packet too small to contain IPv4 header, dropping" << endl;
+        return;
+    }
+
     auto ipv4Header = packet->peekAtFront<Ipv4Header>();
     Ipv4Address dest = ipv4Header->getDestAddress();
     Ipv4Address source = ipv4Header->getSrcAddress();
     Ipv4Address nextHop;
 
     int packetId = packetIdCounter++;
+
+    // If a node is outside of a AP range, use gateway for external destinations
+    if (networkMode == NetworkMode::CLUSTER_MEMBER && !myGateway.isUnspecified()) {
+        // Condition for gateway need
+        if (neighbors.find(dest) == neighbors.end()) {
+            EV_INFO << "Node " << myNodeId << " using gateway " << myGateway
+                    << " for forwarding to " << dest << endl;
+            sendDataThroughGateway(packet->dup(), dest);
+            return;
+        }
+    }
 
     // If destination is a direct neighbor, send directly
     if (neighbors.find(dest) != neighbors.end()) {
@@ -1172,16 +1265,29 @@ Ipv4Address Wca::findBestGateway()
 
 void Wca::updateNetworkMode()
 {
+     EV_INFO << "Node " << myNodeId << " updateNetworkMode() called" << endl;
+
     NetworkMode oldMode = networkMode;
 
     hasAPConnectivity = checkAPConnectivity();
     distanceToNearestAP = getDistanceToNearestAP();
 
+    EV_INFO << "Node " << myNodeId << " AP check: hasAP=" << hasAPConnectivity
+            << ", distToAP=" << distanceToNearestAP
+            << ", radioRange=" << radioRange
+            << ", isCH=" << isClusterHead
+            << ", members=" << clusterMembers.size() << endl;
+
     if (hasAPConnectivity) {
-        // Node has AP access
-        if (isClusterHead && hasMembersOutsideAPRange()) {
-            // Node is a CH with members and members need gateway
+        EV_INFO << "Node " << myNodeId << " has AP, checking shouldBecomeGateway" << endl;
+
+        if (shouldBecomeGateway()) {
             networkMode = NetworkMode::GATEWAY;
+            if (oldMode != NetworkMode::GATEWAY) {
+                EV_INFO << "Node " << myNodeId << " becoming GATEWAY (score="
+                        << calculateGatewayScore() << ")" << endl;
+                sendGatewayAnnouncement();
+            }
         }
         else {
             // Direct AP access, no gateway duties
@@ -1189,15 +1295,23 @@ void Wca::updateNetworkMode()
         }
     }
     else {
-        // No AP access, needs to find a gateway
+        EV_INFO << "Node " << myNodeId << " no AP, finding gateway..." << endl;
+
+        // No AP access - need to find a gateway
         Ipv4Address gateway = findBestGateway();
+        EV_INFO << "Node " << myNodeId << " findBestGateway returned: " << gateway << endl;
+
         if (!gateway.isUnspecified()) {
             networkMode = NetworkMode::CLUSTER_MEMBER;
             myGateway = gateway;
         }
         else {
-            networkMode = NetworkMode::DISCONNECTED;
-            myGateway = Ipv4Address::UNSPECIFIED_ADDRESS;
+            if (networkMode != NetworkMode::DISCONNECTED) {
+                EV_INFO << "Node " << myNodeId << " becoming DISCONNECTED, sending discovery" << endl;
+                networkMode = NetworkMode::DISCONNECTED;
+                myGateway = Ipv4Address::UNSPECIFIED_ADDRESS;
+                sendGatewayDiscoveryRequest();
+            }
         }
     }
 
@@ -1205,11 +1319,13 @@ void Wca::updateNetworkMode()
         EV_INFO << "Node " << myNodeId << " mode changed: "
                 << networkModeToString(oldMode) << " -> "
                 << networkModeToString(networkMode) << endl;
+        updateVisualization();
     }
 }
 bool Wca::hasMembersOutsideAPRange()
 {
     if (clusterMembers.empty()) {
+        EV_INFO << "Node " << myNodeId << " hasMembersOutsideAPRange: no members" << endl;
         return false;
     }
 
@@ -1222,6 +1338,7 @@ bool Wca::hasMembersOutsideAPRange()
             }
         }
     }
+    EV_INFO << "Node " << myNodeId << " hasMembersOutsideAPRange: NO (all members have AP)" << endl;
 
     return false;
 }
@@ -1268,4 +1385,548 @@ void Wca::visualizeAPCoverage()
     }
 }
 
+void Wca::sendGatewayAnnouncement()
+{
+    if (networkMode != NetworkMode::GATEWAY) {
+        return;
+    }
+
+    Packet *packet = new Packet("HWCA-GATEWAY-ANNOUNCE");
+    const auto& announce = makeShared<WcaPacket>();
+
+    announce->setPacketType(WcaPacketType::GATEWAY_ANNOUNCE);
+    announce->setSourceAddress(myAddress);
+    announce->setDestAddress(Ipv4Address::ALLONES_ADDRESS);
+    announce->setGatewayAddress(myAddress);
+    announce->setNetworkMode(static_cast<int>(networkMode));
+    announce->setWeight(myWeight);
+    announce->setHasAPConnectivity(hasAPConnectivity);
+    announce->setDistanceToAP(distanceToNearestAP);
+    announce->setChunkLength(B(48));
+
+    packet->insertAtBack(announce);
+
+    EV_INFO << "Node " << myNodeId << " announcing GATEWAY role" << endl;
+
+    sendPacket(packet, Ipv4Address::ALLONES_ADDRESS);
+}
+void Wca::processGatewayAnnouncement(const Ptr<const WcaPacket>& wcaPacket)
+{
+    Ipv4Address gwAddr = wcaPacket->getGatewayAddress();
+
+    // Update neighbor info
+    auto it = neighbors.find(gwAddr);
+    if (it != neighbors.end()) {
+        it->second.hasAPConnectivity = wcaPacket->getHasAPConnectivity();
+        it->second.isClusterHead = true;  // Gateways are clusterheads
+    }
+
+    EV_INFO << "Node " << myNodeId << " received GATEWAY announcement from "
+            << gwAddr << endl;
+
+    // If a node is outside AP range and disconnected, consider joining this gateway
+    if (!hasAPConnectivity && networkMode == NetworkMode::DISCONNECTED) {
+        myGateway = gwAddr;
+        networkMode = NetworkMode::CLUSTER_MEMBER;
+        joinCluster(gwAddr);
+
+        EV_INFO << "Node " << myNodeId << " joining gateway " << gwAddr << endl;
+    }
+    // If a node is a cluster member, check if this is a better gateway
+    else if (networkMode == NetworkMode::CLUSTER_MEMBER) {
+        if (wcaPacket->getWeight() < myWeight) {
+            auto currentGW = neighbors.find(myGateway);
+            if (currentGW == neighbors.end() ||
+                wcaPacket->getWeight() < currentGW->second.weight) {
+                myGateway = gwAddr;
+                joinCluster(gwAddr);
+                EV_INFO << "Node " << myNodeId << " switching to better gateway "
+                        << gwAddr << endl;
+            }
+        }
+    }
+
+    updateVisualization();
+}
+
+
+void Wca::sendDataThroughGateway(Packet *packet, const Ipv4Address& finalDest)
+{
+    if (myGateway.isUnspecified()) {
+        EV_WARN << "Node " << myNodeId << " has no gateway, dropping packet" << endl;
+        delete packet;
+        return;
+    }
+
+    // Create a forward wrapper packet
+    Packet *fwdPacket = new Packet("HWCA-DATA-FORWARD");
+    const auto& fwdHeader = makeShared<WcaPacket>();
+
+    fwdHeader->setPacketType(WcaPacketType::DATA_FORWARD);
+    fwdHeader->setSourceAddress(myAddress);
+    fwdHeader->setDestAddress(myGateway);
+    fwdHeader->setOriginalSource(myAddress);
+    fwdHeader->setFinalDestination(finalDest);
+    fwdHeader->setGatewayAddress(myGateway);
+    fwdHeader->setChunkLength(B(64));
+
+    fwdPacket->insertAtBack(fwdHeader);
+
+    // Copy payload from original packet if any
+    if (packet->getDataLength() > B(0)) {
+        auto payload = packet->peekDataAt(B(0), packet->getDataLength());
+        fwdPacket->insertAtBack(payload);
+    }
+
+    EV_INFO << "Node " << myNodeId << " forwarding data through gateway "
+            << myGateway << " to final dest " << finalDest << endl;
+
+    sendPacket(fwdPacket, myGateway);
+    delete packet;
+}
+
+
+void Wca::processDataForward(Packet *packet, const Ptr<const WcaPacket>& wcaPacket)
+{
+    Ipv4Address originalSrc = wcaPacket->getOriginalSource();
+    Ipv4Address finalDest = wcaPacket->getFinalDestination();
+
+    EV_INFO << "Node " << myNodeId << " received DATA_FORWARD from "
+            << originalSrc << " destined for " << finalDest << endl;
+
+
+    if (finalDest == myAddress) {
+        EV_INFO << "Node " << myNodeId << " is final destination, delivering packet from "
+                << originalSrc << endl;
+        metricsLogger->logPacketReceived(wcaPacket->getSequenceNumber(), myNodeId, simTime(), 1);
+        return;
+    }
+
+    if (networkMode == NetworkMode::GATEWAY || networkMode == NetworkMode::DIRECT_AP) {
+        if (hasAPConnectivity) {
+            EV_INFO << "Gateway " << myNodeId << " forwarding to destination "
+                    << finalDest << endl;
+
+            Packet *outPacket = new Packet("HWCA-FORWARDED");
+            const auto& fwdData = makeShared<WcaPacket>();
+
+            fwdData->setPacketType(WcaPacketType::DATA_FORWARD);
+            fwdData->setSourceAddress(myAddress);
+            fwdData->setDestAddress(finalDest);
+            fwdData->setOriginalSource(originalSrc);
+            fwdData->setFinalDestination(finalDest);
+            fwdData->setChunkLength(B(64));
+
+            outPacket->insertAtBack(fwdData);
+
+            outPacket->addTagIfAbsent<PacketProtocolTag>()->setProtocol(&Protocol::manet);
+            outPacket->addTagIfAbsent<DispatchProtocolReq>()->setProtocol(&Protocol::ipv4);
+
+            auto addrReq = outPacket->addTagIfAbsent<L3AddressReq>();
+            addrReq->setSrcAddress(L3Address(myAddress));
+            addrReq->setDestAddress(L3Address(finalDest));
+
+            outPacket->addTagIfAbsent<InterfaceReq>()->setInterfaceId(interface80211->getInterfaceId());
+
+            send(outPacket, "ipOut");
+
+            EV_INFO << "Gateway " << myNodeId << " forwarded packet from "
+                    << originalSrc << " to " << finalDest << endl;
+        }
+        else {
+            EV_WARN << "Gateway " << myNodeId << " lost AP connectivity!" << endl;
+        }
+    }
+    else {
+        // I'm not a gateway - forward to my gateway if I have one
+        if (!myGateway.isUnspecified()) {
+            EV_INFO << "Node " << myNodeId << " relaying to gateway " << myGateway << endl;
+            Packet *fwdPacket = packet->dup();
+            sendPacket(fwdPacket, myGateway);
+        }
+        else {
+            EV_WARN << "Node " << myNodeId << " cannot forward - no gateway" << endl;
+        }
+    }
+}
+
+void Wca::sendStatusReport()
+{
+    Packet *packet = new Packet("HWCA-STATUS-REPORT");
+    const auto& report = makeShared<WcaPacket>();
+
+    report->setPacketType(WcaPacketType::STATUS_REPORT);
+    report->setSourceAddress(myAddress);
+    report->setDestAddress(serverAddress);
+    report->setSequenceNumber(statusSequenceNumber++);
+    report->setNetworkMode(static_cast<int>(networkMode));
+    report->setIsClusterHead(isClusterHead);
+    report->setClusterHeadAddress(isClusterHead ? myAddress : myClusterHead);
+    report->setGatewayAddress(myGateway);
+    report->setHasAPConnectivity(hasAPConnectivity);
+    report->setDistanceToAP(distanceToNearestAP);
+    report->setWeight(myWeight);
+
+    // Energy level
+    if (energyStorage) {
+        double remaining = energyStorage->getResidualEnergyCapacity().get();
+        double nominal = energyStorage->getNominalEnergyCapacity().get();
+        report->setEnergyLevel(remaining / nominal);
+    } else {
+        report->setEnergyLevel(1.0);
+    }
+
+    // Task info todo placeholder atm
+    std::ostringstream taskOss;
+    taskOss << "Node" << myNodeId << "_" << networkModeToString(networkMode);
+    report->setTaskInfo(taskOss.str().c_str());
+
+    report->setTimestamp(simTime());
+    report->setChunkLength(B(96));
+
+    packet->insertAtBack(report);
+
+    EV_INFO << "Node " << myNodeId << " sending status report #"
+            << (statusSequenceNumber - 1) << " to server" << endl;
+
+    // If we have AP connectivity, send directly otherwise use gateway
+    if (hasAPConnectivity) {
+        sendPacket(packet, serverAddress);
+    } else if (!myGateway.isUnspecified()) {
+        sendDataThroughGateway(packet, serverAddress);
+    } else {
+        EV_WARN << "Node " << myNodeId << " cannot send status report - no connectivity" << endl;
+        delete packet;
+    }
+}
+
+void Wca::processStatusReport(const Ptr<const WcaPacket>& wcaPacket)
+{
+	// todo server module
+    EV_INFO << "Received status report from " << wcaPacket->getSourceAddress()
+            << " seq=" << wcaPacket->getSequenceNumber()
+            << " mode=" << wcaPacket->getNetworkMode()
+            << " energy=" << wcaPacket->getEnergyLevel() << endl;
+}
+
+
+void Wca::processServerBroadcast(const Ptr<const WcaPacket>& wcaPacket)
+{
+    EV_INFO << "Node " << myNodeId << " received SERVER_BROADCAST seq="
+            << wcaPacket->getSequenceNumber()
+            << " command=\"" << wcaPacket->getServerCommand() << "\"" << endl;
+
+    // todo process
+    std::string command = wcaPacket->getServerCommand();
+
+    if (command == "STATUS_REQUEST") {
+        // Server requesting immediate status update
+        sendStatusReport();
+    }
+    else if (command == "RECONFIGURE") {
+        // Trigger cluster re-election
+        performClusterElection();
+    }
+    // Add more commands as needed
+
+    // If a node is a gateway, forward to my cluster members who don't have AP access
+    if (networkMode == NetworkMode::GATEWAY) {
+        for (const auto& memberAddr : clusterMembers) {
+            auto it = neighbors.find(memberAddr);
+            if (it != neighbors.end() && !it->second.hasAPConnectivity) {
+                // Forward broadcast to this member
+                Packet *fwdPacket = new Packet("HWCA-SERVER-BROADCAST-FWD");
+                const auto& fwdBcast = makeShared<WcaPacket>();
+
+                fwdBcast->setPacketType(WcaPacketType::SERVER_BROADCAST);
+                fwdBcast->setSourceAddress(serverAddress);
+                fwdBcast->setDestAddress(memberAddr);
+                fwdBcast->setSequenceNumber(wcaPacket->getSequenceNumber());
+                fwdBcast->setServerCommand(wcaPacket->getServerCommand());
+                fwdBcast->setChunkLength(B(64));
+
+                fwdPacket->insertAtBack(fwdBcast);
+                sendPacket(fwdPacket, memberAddr);
+
+                EV_INFO << "Gateway " << myNodeId << " forwarding broadcast to member "
+                        << memberAddr << endl;
+            }
+        }
+    }
+}
+
+double Wca::calculateGatewayScore()
+{
+    if (!hasAPConnectivity) {
+        return DBL_MAX;
+    }
+
+    if (radioRange <= 0) {
+        return 0.5;
+    }
+
+    double normAPDist = distanceToNearestAP / radioRange;
+    if (normAPDist > 1.0) normAPDist = 1.0;
+
+    int membersNeedingGateway = 0;
+    for (const auto& memberAddr : clusterMembers) {
+        auto it = neighbors.find(memberAddr);
+        if (it != neighbors.end() && !it->second.hasAPConnectivity) {
+            membersNeedingGateway++;
+        }
+    }
+
+    double memberFactor = 1.0 / (1.0 + membersNeedingGateway);
+
+    double mob = calculateMobility();
+    double normMobility = mob / 20.0;
+    if (normMobility > 1.0) normMobility = 1.0;
+
+    double energyFactor = 0.5;
+    if (energyStorage) {
+        double nominal = energyStorage->getNominalEnergyCapacity().get();
+        double remaining = energyStorage->getResidualEnergyCapacity().get();
+
+        if (std::isfinite(nominal) && std::isfinite(remaining) && nominal > 0) {
+            energyFactor = 1.0 - (remaining / nominal);
+            if (energyFactor < 0.0) energyFactor = 0.0;
+            if (energyFactor > 1.0) energyFactor = 1.0;
+        }
+    }
+
+    double score = 0.4 * normAPDist +
+                   0.2 * memberFactor +
+                   0.2 * normMobility +
+                   0.2 * energyFactor;
+
+    return score;
+}
+
+bool Wca::shouldBecomeGateway()
+{
+    EV_INFO << "Node " << myNodeId << " shouldBecomeGateway() called: hasAP="
+            << hasAPConnectivity << ", isCH=" << isClusterHead << endl;
+    if (!hasAPConnectivity || !isClusterHead) {
+        return false;
+    }
+
+    if (!hasMembersOutsideAPRange()) {
+        return false;
+    }
+
+    double myScore = calculateGatewayScore();
+
+    // Check if any neighbor would be a better gateway
+    for (const auto& pair : neighbors) {
+        if (pair.second.hasAPConnectivity && pair.second.gatewayScore >= 0) {
+            // Neighbor is a gateway candidate
+            if (pair.second.gatewayScore < myScore) {
+                return false;  // Neighbor has better score
+            }
+            // todo better logic maybe Tie braker
+            if (pair.second.gatewayScore == myScore && pair.first < myAddress) {
+                return false;
+            }
+        }
+    }
+
+    EV_INFO << "Node " << myNodeId << " shouldBecomeGateway: YES (score=" << myScore << ")" << endl;
+    return true;
+}
+
+void Wca::triggerGatewayElection()
+{
+    NetworkMode oldMode = networkMode;
+
+    if (shouldBecomeGateway()) {
+        if (networkMode != NetworkMode::GATEWAY) {
+            networkMode = NetworkMode::GATEWAY;
+            sendGatewayAnnouncement();
+            EV_INFO << "Node " << myNodeId << " elected as GATEWAY (score="
+                    << calculateGatewayScore() << ")" << endl;
+        }
+    }
+    else if (hasAPConnectivity) {
+        networkMode = NetworkMode::DIRECT_AP;
+    }
+
+    if (oldMode != networkMode) {
+        updateVisualization();
+    }
+}
+void Wca::sendGatewayDiscoveryRequest()
+{
+    if (hasAPConnectivity) {
+        return;  // Don't need a gateway
+    }
+
+    Packet *packet = new Packet("HWCA-GW-DISCOVERY-REQ");
+    const auto& request = makeShared<WcaPacket>();
+
+    request->setPacketType(WcaPacketType::GATEWAY_DISCOVERY_REQUEST);
+    request->setSourceAddress(myAddress);
+    request->setDestAddress(Ipv4Address::ALLONES_ADDRESS);
+    request->setWeight(myWeight);
+    request->setChunkLength(B(32));
+
+    packet->insertAtBack(request);
+
+    EV_INFO << "Node " << myNodeId << " sending gateway discovery request" << endl;
+
+    sendPacket(packet, Ipv4Address::ALLONES_ADDRESS);
+}
+
+void Wca::processGatewayDiscoveryRequest(const Ptr<const WcaPacket>& wcaPacket)
+{
+    Ipv4Address requesterAddr = wcaPacket->getSourceAddress();
+
+    if (!hasAPConnectivity) {
+        return;
+    }
+
+    EV_INFO << "Node " << myNodeId << " received gateway discovery from "
+            << requesterAddr << ", responding" << endl;
+
+    Packet *packet = new Packet("HWCA-GW-DISCOVERY-REPLY");
+    const auto& reply = makeShared<WcaPacket>();
+
+    reply->setPacketType(WcaPacketType::GATEWAY_DISCOVERY_REPLY);
+    reply->setSourceAddress(myAddress);
+    reply->setDestAddress(requesterAddr);
+    reply->setGatewayAddress(myAddress);
+    reply->setWeight(myWeight);
+    reply->setHasAPConnectivity(true);
+    reply->setDistanceToAP(distanceToNearestAP);
+    reply->setIsClusterHead(isClusterHead);
+    reply->setNetworkMode(static_cast<int>(networkMode));
+    reply->setChunkLength(B(48));
+
+    packet->insertAtBack(reply);
+
+    sendPacket(packet, requesterAddr);
+}
+
+void Wca::processGatewayDiscoveryReply(const Ptr<const WcaPacket>& wcaPacket)
+{
+    Ipv4Address gwAddr = wcaPacket->getGatewayAddress();
+    double gwWeight = wcaPacket->getWeight();
+    double gwAPDist = wcaPacket->getDistanceToAP();
+
+    EV_INFO << "Node " << myNodeId << " received gateway discovery reply from "
+            << gwAddr << " (weight=" << gwWeight << ", apDist=" << gwAPDist << ")" << endl;
+
+    // Update neighbor info
+    auto it = neighbors.find(gwAddr);
+    if (it != neighbors.end()) {
+        it->second.hasAPConnectivity = true;
+        it->second.weight = gwWeight;
+        it->second.isClusterHead = wcaPacket->isClusterHead();
+    }
+
+    // If the node is disconnected or this is a better gateway, switch to it
+    if (networkMode == NetworkMode::DISCONNECTED) {
+        myGateway = gwAddr;
+        networkMode = NetworkMode::CLUSTER_MEMBER;
+        joinCluster(gwAddr);
+        EV_INFO << "Node " << myNodeId << " found gateway " << gwAddr << endl;
+    }
+    else if (networkMode == NetworkMode::CLUSTER_MEMBER) {
+        // Check if this is a better gateway
+        auto currentGW = neighbors.find(myGateway);
+        bool shouldSwitch = false;
+
+        if (currentGW == neighbors.end()) {
+            shouldSwitch = true;  // Current gateway gone
+        }
+        else if (!currentGW->second.hasAPConnectivity) {
+            shouldSwitch = true;  // Current gateway lost AP
+        }
+        else if (gwWeight < currentGW->second.weight) {
+            shouldSwitch = true;  // New gateway is better
+        }
+
+        if (shouldSwitch) {
+            myGateway = gwAddr;
+            joinCluster(gwAddr);
+            EV_INFO << "Node " << myNodeId << " switching to better gateway " << gwAddr << endl;
+        }
+    }
+
+    updateVisualization();
+}
+void Wca::checkGatewayHandover()
+{
+    // Only relevant for cluster members using a gateway
+    if (networkMode != NetworkMode::CLUSTER_MEMBER || myGateway.isUnspecified()) {
+        return;
+    }
+
+    // Check if current gateway is still valid
+    auto currentGW = neighbors.find(myGateway);
+    bool currentGWValid = (currentGW != neighbors.end() &&
+                           currentGW->second.hasAPConnectivity);
+
+    // Find best available gateway
+    Ipv4Address bestGateway;
+    double bestScore = DBL_MAX;
+
+    for (const auto& pair : neighbors) {
+        if (pair.second.hasAPConnectivity) {
+            // Calculate a score based on weight and distance to AP
+            // Lower score = better gateway
+            double score = pair.second.weight;
+
+            if (score < bestScore) {
+                bestScore = score;
+                bestGateway = pair.first;
+            }
+        }
+    }
+
+    // Decide if handover is needed
+    if (!currentGWValid && !bestGateway.isUnspecified()) {
+        // Current gateway lost
+        EV_INFO << "Node " << myNodeId << " gateway " << myGateway
+                << " lost, handing over to " << bestGateway << endl;
+        performGatewayHandover(bestGateway);
+    }
+    else if (currentGWValid && !bestGateway.isUnspecified() && bestGateway != myGateway) {
+        double currentScore = currentGW->second.weight;
+        double improvement = (currentScore - bestScore) / currentScore;
+
+        // Avoid ping-pong
+        if (improvement > 0.2) {
+            EV_INFO << "Node " << myNodeId << " found better gateway " << bestGateway
+                    << " (improvement=" << (improvement * 100) << "%)" << endl;
+            performGatewayHandover(bestGateway);
+        }
+    }
+    else if (!currentGWValid && bestGateway.isUnspecified()) {
+        // No gateway available - become disconnected
+        EV_WARN << "Node " << myNodeId << " lost gateway and no alternative found" << endl;
+        networkMode = NetworkMode::DISCONNECTED;
+        myGateway = Ipv4Address::UNSPECIFIED_ADDRESS;
+        sendGatewayDiscoveryRequest();
+        updateVisualization();
+    }
+}
+
+void Wca::performGatewayHandover(const Ipv4Address& newGateway)
+{
+    Ipv4Address oldGateway = myGateway;
+
+    // Leave old cluster if we were a member
+    if (!oldGateway.isUnspecified() && oldGateway != newGateway) {
+        EV_INFO << "Node " << myNodeId << " leaving gateway " << oldGateway << endl;
+    }
+
+    // Join new gateway
+    myGateway = newGateway;
+    networkMode = NetworkMode::CLUSTER_MEMBER;
+    joinCluster(newGateway);
+
+    EV_INFO << "Node " << myNodeId << " completed handover to gateway " << newGateway << endl;
+
+    updateVisualization();
+}
 } // namespace hwca

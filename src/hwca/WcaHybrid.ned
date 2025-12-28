@@ -36,7 +36,9 @@ simple Wca like IApp
         string apPositions = default("");              // AP positions as "x1,y1;x2,y2;..."
         // ideal number of neighbors
         int idealDegree = default(5);
-        
+        // HWCA Status reporting
+        double statusReportInterval @unit(s) = default(5s);
+        string serverAddress = default("");
         // Statistics signals
         @signal[clusterHeadChanged](type=bool);
         @signal[nodeWeight](type=double);

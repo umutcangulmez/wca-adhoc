@@ -32,6 +32,7 @@ struct NeighborInfo {
     Ipv4Address clusterHeadAddress;
     simtime_t lastSeen;
     bool hasAPConnectivity;
+    double gatewayScore;
 
 };
   enum class NetworkMode {
@@ -71,6 +72,10 @@ class Wca : public cSimpleModule, public NetfilterBase::HookBase
     cMessage *helloTimer = nullptr;
     cMessage *clusterTimer = nullptr;
     cMessage *metricTimer = nullptr;
+    cMessage *statusReportTimer = nullptr;
+    double statusReportInterval;
+    Ipv4Address serverAddress;
+    int statusSequenceNumber;
 
     IInterfaceTable *interfaceTable = nullptr;
     IIpv4RoutingTable *routingTable = nullptr;
@@ -151,7 +156,24 @@ class Wca : public cSimpleModule, public NetfilterBase::HookBase
     const char* networkModeToString(NetworkMode mode);
     void parseAPPositions(const char* apPosStr);
     bool hasMembersOutsideAPRange();
+    void sendGatewayAnnouncement();
+    void processGatewayAnnouncement(const Ptr<const WcaPacket>& wcaPacket);
+    void sendDataThroughGateway(Packet *packet, const Ipv4Address& finalDest);
+    void processDataForward(Packet *packet, const Ptr<const WcaPacket>& wcaPacket);
+    void sendStatusReport();
+    void processStatusReport(const Ptr<const WcaPacket>& wcaPacket);
+    void processServerBroadcast(const Ptr<const WcaPacket>& wcaPacket);
 
+    void triggerGatewayElection();
+    bool shouldBecomeGateway();
+    double calculateGatewayScore();
+
+    void sendGatewayDiscoveryRequest();
+    void processGatewayDiscoveryRequest(const Ptr<const WcaPacket>& wcaPacket);
+    void processGatewayDiscoveryReply(const Ptr<const WcaPacket>& wcaPacket);
+
+    void checkGatewayHandover();
+    void performGatewayHandover(const Ipv4Address& newGateway);
   public:
     virtual ~Wca();
 

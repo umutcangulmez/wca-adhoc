@@ -14,6 +14,13 @@ enum WcaPacketType {
     CLUSTER_HEAD_ANNOUNCEMENT = 1;
     JOIN_REQUEST = 2;
     JOIN_REPLY = 3;
+    // HWCA extensions
+    GATEWAY_ANNOUNCE = 4;
+    STATUS_REPORT = 5;
+    SERVER_BROADCAST = 6;
+    DATA_FORWARD = 7;
+    GATEWAY_DISCOVERY_REQUEST = 8;
+    GATEWAY_DISCOVERY_REPLY = 9;
 }
 
 class WcaPacket extends inet::FieldsChunk
@@ -38,5 +45,23 @@ class WcaPacket extends inet::FieldsChunk
 
     bool hasAPConnectivity = false;      // Whether sender can reach an AP
     double distanceToAP = -1;            // Distance to nearest AP
+    // HWCA Gateway/Server fields
+    int networkMode = 0;                 // NetworkMode enum value
+    inet::Ipv4Address gatewayAddress;    // Gateway for forwarding
+
+
+    double gatewayScore = -1;           // Gateway election score (-1 = not a gateway candidate)
+
+    // Status report fields (robot -> server)
+    double energyLevel = 1.0;
+    string taskInfo = "";
+
+    // Server broadcast fields (server -> robots)
+    string serverCommand = "";
+
+    // Data forwarding fields
+    inet::Ipv4Address originalSource;
+    inet::Ipv4Address finalDestination;
+
 
 }
