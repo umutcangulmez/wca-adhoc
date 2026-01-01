@@ -18,6 +18,11 @@ network WcaNetwork
             @display("p=100,250");
         }
 
+        // Centralized server
+        server: HwcaServerHost {
+            @display("p=600,400;i=device/server");
+        }
+
         // Mobile ad-hoc nodes with WCA clustering
         host[numHosts]: WcaHost {
             @display("i=device/robot");
