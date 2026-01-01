@@ -141,9 +141,21 @@ void Wca::initialize(int stage)
         const char *apPosStr = par("apPositions").stringValue();
         parseAPPositions(apPosStr);
 
+        // Initialize metric logger
+        metricsLogger = new WCAMetricsLogger();
+
         // Check initial AP connectivity
         hasAPConnectivity = checkAPConnectivity();
         distanceToNearestAP = getDistanceToNearestAP();
+
+        if (hasAPConnectivity) {
+            metricsLogger->logNetworkModeChange(MetricNetworkMode::DIRECT_AP, simTime());
+        } else {
+            metricsLogger->logNetworkModeChange(MetricNetworkMode::DISCONNECTED, simTime());
+        }
+
+
+
         updateNetworkMode();
 
         EV_INFO << "Node " << myNodeId << " initial AP connectivity: "
@@ -161,8 +173,7 @@ void Wca::initialize(int stage)
         networkProtocol = getModuleFromPar<INetfilter>(par("networkProtocolModule"), this);
         networkProtocol->registerHook(0, this);
 
-        // Initialize metric logger
-        metricsLogger = new WCAMetricsLogger();
+
         std::string nodeIdStr = std::to_string(myNodeId);
         std::string logFile = "results/wca_performance_node" + nodeIdStr + ".log";
         std::string csvFile = "results/wca_metrics_node" + nodeIdStr + ".csv";
@@ -393,8 +404,12 @@ void Wca::handleMessage(cMessage *msg)
             scheduleAt(simTime() + 5.0, msg);  // Log every 5 seconds for better resolution
         }
         else if (msg == statusReportTimer) {
+            EV_INFO << "Node " << myNodeId << " statusReportTimer fired at " << simTime() << endl;
+
             sendStatusReport();
             scheduleAt(simTime() + statusReportInterval, statusReportTimer);
+            EV_INFO << "Node " << myNodeId << " next status report scheduled at "
+                    << (simTime() + statusReportInterval) << endl;
         }
     }
     else {
@@ -776,6 +791,9 @@ void Wca::processJoinRequest(const Ptr<const WcaPacket>& wcaPacket)
 
     EV_INFO << "Node " << memberAddr << " joined cluster (" << clusterMembers.size() << " members)" << endl;
 
+    if (networkMode == NetworkMode::GATEWAY) {
+        metricsLogger->logGatewayServing(clusterMembers.size(), simTime());
+    }
     Packet *replyPacket = new Packet("WCA-JOIN-REPLY");
     const auto& joinReply = makeShared<WcaPacket>();
 
@@ -1265,38 +1283,30 @@ Ipv4Address Wca::findBestGateway()
 
 void Wca::updateNetworkMode()
 {
-     EV_INFO << "Node " << myNodeId << " updateNetworkMode() called" << endl;
-
     NetworkMode oldMode = networkMode;
 
     hasAPConnectivity = checkAPConnectivity();
     distanceToNearestAP = getDistanceToNearestAP();
 
-    EV_INFO << "Node " << myNodeId << " AP check: hasAP=" << hasAPConnectivity
-            << ", distToAP=" << distanceToNearestAP
-            << ", radioRange=" << radioRange
-            << ", isCH=" << isClusterHead
-            << ", members=" << clusterMembers.size() << endl;
-
     if (hasAPConnectivity) {
-        EV_INFO << "Node " << myNodeId << " has AP, checking shouldBecomeGateway" << endl;
-
         if (shouldBecomeGateway()) {
             networkMode = NetworkMode::GATEWAY;
             if (oldMode != NetworkMode::GATEWAY) {
                 EV_INFO << "Node " << myNodeId << " becoming GATEWAY (score="
                         << calculateGatewayScore() << ")" << endl;
-                sendGatewayAnnouncement();
+            metricsLogger->logNetworkModeChange(MetricNetworkMode::GATEWAY, simTime());
+            metricsLogger->logGatewayElection(simTime());
+			sendGatewayAnnouncement();
             }
         }
         else {
-            // Direct AP access, no gateway duties
             networkMode = NetworkMode::DIRECT_AP;
+            if (oldMode != NetworkMode::DIRECT_AP) {
+                metricsLogger->logNetworkModeChange(MetricNetworkMode::DIRECT_AP, simTime());
+            }
         }
     }
     else {
-        EV_INFO << "Node " << myNodeId << " no AP, finding gateway..." << endl;
-
         // No AP access - need to find a gateway
         Ipv4Address gateway = findBestGateway();
         EV_INFO << "Node " << myNodeId << " findBestGateway returned: " << gateway << endl;
@@ -1304,6 +1314,16 @@ void Wca::updateNetworkMode()
         if (!gateway.isUnspecified()) {
             networkMode = NetworkMode::CLUSTER_MEMBER;
             myGateway = gateway;
+            if (oldMode != NetworkMode::CLUSTER_MEMBER) {
+                metricsLogger->logNetworkModeChange(MetricNetworkMode::CLUSTER_MEMBER, simTime());
+            }
+        }
+        else if (!myClusterHead.isUnspecified()) {
+            networkMode = NetworkMode::CLUSTER_MEMBER;
+            myGateway = myClusterHead;
+            if (oldMode != NetworkMode::CLUSTER_MEMBER) {
+                metricsLogger->logNetworkModeChange(MetricNetworkMode::CLUSTER_MEMBER, simTime());
+            }
         }
         else {
             if (networkMode != NetworkMode::DISCONNECTED) {
@@ -1311,8 +1331,14 @@ void Wca::updateNetworkMode()
                 networkMode = NetworkMode::DISCONNECTED;
                 myGateway = Ipv4Address::UNSPECIFIED_ADDRESS;
                 sendGatewayDiscoveryRequest();
+                metricsLogger->logNetworkModeChange(MetricNetworkMode::DISCONNECTED, simTime());
+                metricsLogger->logDisconnection(simTime());
             }
         }
+    }
+    // Log reconnection
+    if (oldMode == NetworkMode::DISCONNECTED && networkMode != NetworkMode::DISCONNECTED) {
+        metricsLogger->logReconnection(simTime());
     }
 
     if (oldMode != networkMode) {
@@ -1454,9 +1480,13 @@ void Wca::sendDataThroughGateway(Packet *packet, const Ipv4Address& finalDest)
 {
     if (myGateway.isUnspecified()) {
         EV_WARN << "Node " << myNodeId << " has no gateway, dropping packet" << endl;
+        metricsLogger->logPacketDropped(0, myNodeId, "no gateway", simTime());
         delete packet;
         return;
     }
+
+
+    const auto& originalData = packet->peekAtFront<WcaPacket>();
 
     // Create a forward wrapper packet
     Packet *fwdPacket = new Packet("HWCA-DATA-FORWARD");
@@ -1468,20 +1498,31 @@ void Wca::sendDataThroughGateway(Packet *packet, const Ipv4Address& finalDest)
     fwdHeader->setOriginalSource(myAddress);
     fwdHeader->setFinalDestination(finalDest);
     fwdHeader->setGatewayAddress(myGateway);
-    fwdHeader->setChunkLength(B(64));
+
+    // Copy the original status report data
+    fwdHeader->setNetworkMode(originalData->getNetworkMode());
+    fwdHeader->setEnergyLevel(originalData->getEnergyLevel());
+    fwdHeader->setIsClusterHead(originalData->isClusterHead());
+    fwdHeader->setClusterHeadAddress(originalData->getClusterHeadAddress());
+    fwdHeader->setHasAPConnectivity(originalData->getHasAPConnectivity());
+    fwdHeader->setSequenceNumber(originalData->getSequenceNumber());
+    fwdHeader->setDistanceToAP(originalData->getDistanceToAP());
+    fwdHeader->setWeight(originalData->getWeight());
+    fwdHeader->setTaskInfo(originalData->getTaskInfo());
+
+    fwdHeader->setChunkLength(B(128));
 
     fwdPacket->insertAtBack(fwdHeader);
 
-    // Copy payload from original packet if any
-    if (packet->getDataLength() > B(0)) {
-        auto payload = packet->peekDataAt(B(0), packet->getDataLength());
-        fwdPacket->insertAtBack(payload);
-    }
-
     EV_INFO << "Node " << myNodeId << " forwarding data through gateway "
-            << myGateway << " to final dest " << finalDest << endl;
+            << myGateway << " to final dest " << finalDest
+            << " [seq=" << originalData->getSequenceNumber() << "]" << endl;
 
     sendPacket(fwdPacket, myGateway);
+    // Log that forwarded through gateway
+    metricsLogger->logStatusReportForwarded(simTime());
+    metricsLogger->logHopsToServer(2, simTime());  // Beware at least 2 hops: node -> gateway -> server
+
     delete packet;
 }
 
@@ -1491,9 +1532,10 @@ void Wca::processDataForward(Packet *packet, const Ptr<const WcaPacket>& wcaPack
     Ipv4Address originalSrc = wcaPacket->getOriginalSource();
     Ipv4Address finalDest = wcaPacket->getFinalDestination();
 
-    EV_INFO << "Node " << myNodeId << " received DATA_FORWARD from "
-            << originalSrc << " destined for " << finalDest << endl;
-
+    EV_INFO << "Node " << myNodeId << " processDataForward: from "
+            << originalSrc << " to " << finalDest
+            << ", myMode=" << networkModeToString(networkMode)
+            << ", hasAP=" << hasAPConnectivity << endl;
 
     if (finalDest == myAddress) {
         EV_INFO << "Node " << myNodeId << " is final destination, delivering packet from "
@@ -1504,18 +1546,27 @@ void Wca::processDataForward(Packet *packet, const Ptr<const WcaPacket>& wcaPack
 
     if (networkMode == NetworkMode::GATEWAY || networkMode == NetworkMode::DIRECT_AP) {
         if (hasAPConnectivity) {
-            EV_INFO << "Gateway " << myNodeId << " forwarding to destination "
+            EV_INFO << "Node " << myNodeId << " (GATEWAY/DIRECT_AP) forwarding to server "
                     << finalDest << endl;
 
-            Packet *outPacket = new Packet("HWCA-FORWARDED");
+            // Forward the original status report type so server can process it
+            Packet *outPacket = new Packet("HWCA-STATUS-FORWARDED");
             const auto& fwdData = makeShared<WcaPacket>();
 
-            fwdData->setPacketType(WcaPacketType::DATA_FORWARD);
-            fwdData->setSourceAddress(myAddress);
+            fwdData->setPacketType(WcaPacketType::STATUS_REPORT);
+            fwdData->setSourceAddress(originalSrc);  // Original source, not gateway!
             fwdData->setDestAddress(finalDest);
             fwdData->setOriginalSource(originalSrc);
             fwdData->setFinalDestination(finalDest);
-            fwdData->setChunkLength(B(64));
+            fwdData->setNetworkMode(wcaPacket->getNetworkMode());
+            fwdData->setEnergyLevel(wcaPacket->getEnergyLevel());
+            fwdData->setIsClusterHead(wcaPacket->isClusterHead());
+            fwdData->setClusterHeadAddress(wcaPacket->getClusterHeadAddress());
+            fwdData->setGatewayAddress(myAddress);  // I'm the gateway that forwarded this
+            fwdData->setHasAPConnectivity(wcaPacket->getHasAPConnectivity());
+            fwdData->setSequenceNumber(wcaPacket->getSequenceNumber());
+            fwdData->setChunkLength(B(96));
+
 
             outPacket->insertAtBack(fwdData);
 
@@ -1530,11 +1581,11 @@ void Wca::processDataForward(Packet *packet, const Ptr<const WcaPacket>& wcaPack
 
             send(outPacket, "ipOut");
 
-            EV_INFO << "Gateway " << myNodeId << " forwarded packet from "
+            EV_INFO << "Node " << myNodeId << " forwarded packet from "
                     << originalSrc << " to " << finalDest << endl;
         }
         else {
-            EV_WARN << "Gateway " << myNodeId << " lost AP connectivity!" << endl;
+            EV_WARN << "Node " << myNodeId << " is GATEWAY but lost AP connectivity!" << endl;
         }
     }
     else {
@@ -1567,14 +1618,20 @@ void Wca::sendStatusReport()
     report->setDistanceToAP(distanceToNearestAP);
     report->setWeight(myWeight);
 
-    // Energy level
+    // Energy level (infinite/invalid values are handled)
+    double energyLevel = 1.0;
     if (energyStorage) {
-        double remaining = energyStorage->getResidualEnergyCapacity().get();
         double nominal = energyStorage->getNominalEnergyCapacity().get();
-        report->setEnergyLevel(remaining / nominal);
-    } else {
-        report->setEnergyLevel(1.0);
+        double remaining = energyStorage->getResidualEnergyCapacity().get();
+
+        if (std::isfinite(nominal) && std::isfinite(remaining) && nominal > 0) {
+            energyLevel = remaining / nominal;
+            if (!std::isfinite(energyLevel)) {
+                energyLevel = 1.0;
+            }
+        }
     }
+    report->setEnergyLevel(energyLevel);
 
     // Task info todo placeholder atm
     std::ostringstream taskOss;
@@ -1585,17 +1642,46 @@ void Wca::sendStatusReport()
     report->setChunkLength(B(96));
 
     packet->insertAtBack(report);
+    // Log status report sent
+    metricsLogger->logStatusReportSent(simTime());
 
     EV_INFO << "Node " << myNodeId << " sending status report #"
-            << (statusSequenceNumber - 1) << " to server" << endl;
+            << (statusSequenceNumber - 1) << " to server " << serverAddress
+            << " [mode=" << networkModeToString(networkMode)
+            << ", hasAP=" << hasAPConnectivity
+            << ", gateway=" << myGateway
+            << ", CH=" << myClusterHead << "]" << endl;
 
-    // If we have AP connectivity, send directly otherwise use gateway
-    if (hasAPConnectivity) {
+    if (networkMode == NetworkMode::DIRECT_AP) {
+        EV_INFO << "Node " << myNodeId << " sending status via DIRECT_AP" << endl;
+        metricsLogger->logHopsToServer(1, simTime());  // 1 hop: direct to server
         sendPacket(packet, serverAddress);
-    } else if (!myGateway.isUnspecified()) {
-        sendDataThroughGateway(packet, serverAddress);
-    } else {
-        EV_WARN << "Node " << myNodeId << " cannot send status report - no connectivity" << endl;
+    }
+    else if (networkMode == NetworkMode::GATEWAY) {
+        EV_INFO << "Node " << myNodeId << " sending status as GATEWAY (direct)" << endl;
+        metricsLogger->logHopsToServer(1, simTime());  // 1 hop: direct to server
+        sendPacket(packet, serverAddress);
+    }
+    else if (networkMode == NetworkMode::CLUSTER_MEMBER) {
+        Ipv4Address relay = myGateway.isUnspecified() ? myClusterHead : myGateway;
+        if (!relay.isUnspecified()) {
+            EV_INFO << "Node " << myNodeId << " sending status via relay " << relay << endl;
+            sendDataThroughGateway(packet, serverAddress);
+        } else {
+            EV_WARN << "Node " << myNodeId << " CLUSTER_MEMBER but no relay available" << endl;
+            metricsLogger->logPacketDropped(0, myNodeId, "no relay", simTime());
+            delete packet;
+        }
+    }
+    else if (hasAPConnectivity) {
+
+        EV_INFO << "Node " << myNodeId << " sending status via AP (fallback)" << endl;
+        metricsLogger->logHopsToServer(1, simTime());
+        sendPacket(packet, serverAddress);
+    }
+    else {
+        EV_WARN << "Node " << myNodeId << " cannot send status report - DISCONNECTED" << endl;
+        metricsLogger->logPacketDropped(0, myNodeId, "disconnected", simTime());
         delete packet;
     }
 }
@@ -1925,6 +2011,7 @@ void Wca::performGatewayHandover(const Ipv4Address& newGateway)
     networkMode = NetworkMode::CLUSTER_MEMBER;
     joinCluster(newGateway);
 
+    metricsLogger->logGatewayHandover(simTime());
     EV_INFO << "Node " << myNodeId << " completed handover to gateway " << newGateway << endl;
 
     updateVisualization();
