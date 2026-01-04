@@ -55,8 +55,7 @@ WCAMetricsLogger::~WCAMetricsLogger()
 
 void WCAMetricsLogger::initialize(const char* logFilePath, const char* csvFilePath)
 {
-    // Create directory if it doesn't exist
-    mkdir("results", 0755);
+
 
     // Open log file
     logFile.open(logFilePath, std::ios::out | std::ios::trunc);

@@ -143,6 +143,10 @@ void Wca::initialize(int stage)
 
         // Initialize metric logger
         metricsLogger = new WCAMetricsLogger();
+        const char* configName = getEnvir()->getConfigEx()->getActiveConfigName();
+        std::string resultsDir = std::string("results/") + configName;
+        mkdir("results", 0755);
+        mkdir(resultsDir.c_str(), 0755);
 
         // Check initial AP connectivity
         hasAPConnectivity = checkAPConnectivity();
@@ -175,8 +179,9 @@ void Wca::initialize(int stage)
 
 
         std::string nodeIdStr = std::to_string(myNodeId);
-        std::string logFile = "results/wca_performance_node" + nodeIdStr + ".log";
-        std::string csvFile = "results/wca_metrics_node" + nodeIdStr + ".csv";
+        std::string logFile = resultsDir + "/wca_performance_node" + nodeIdStr + ".log";
+        std::string csvFile = resultsDir + "/wca_metrics_node" + nodeIdStr + ".csv";
+
         metricsLogger->initialize(logFile.c_str(), csvFile.c_str());
         metricsLogger->setNodeId(myNodeId);
 

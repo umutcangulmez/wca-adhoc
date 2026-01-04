@@ -117,7 +117,7 @@ void HwcaServer::initialize(int stage)
       EV_INFO << "Server: broadcastTimer fired at t=" << simTime() << endl;
       sendBroadcast();
       logFleetStatus();
-      logServerMetrics(simTime());  // Add this line
+      logServerMetrics(simTime());
       scheduleAt(simTime() + broadcastInterval, broadcastTimer);
     }
     else if (msg == timeoutCheckTimer) {
@@ -354,10 +354,15 @@ void HwcaServer::finish()
   void HwcaServer::initializeMetrics()
 {
   // Create results directory
+  const char* configName = getEnvir()->getConfigEx()->getActiveConfigName();
+  std::string resultsDir = std::string("results/") + configName;
   mkdir("results", 0755);
+  mkdir(resultsDir.c_str(), 0755);
 
-  // Open server CSV file
-  serverCsvFile.open("results/hwca_server_metrics.csv", std::ios::out | std::ios::trunc);
+
+  std::string csvPath = resultsDir + "/hwca_server_metrics.csv";
+  serverCsvFile.open(csvPath, std::ios::out | std::ios::trunc);
+
   if (serverCsvFile.is_open()) {
     serverCsvFile << "time,connected_robots,disconnected_robots,"
                   << "direct_ap_count,gateway_count,cluster_member_count,disconnected_mode_count,"
@@ -366,7 +371,8 @@ void HwcaServer::finish()
   }
 
   // Open server log file
-  serverLogFile.open("results/hwca_server_log.txt", std::ios::out | std::ios::trunc);
+  std::string logPath = resultsDir + "/hwca_server_log.txt";
+  serverLogFile.open(logPath, std::ios::out | std::ios::trunc);
   if (serverLogFile.is_open()) {
     serverLogFile << "HWCA Server Metrics Log\n";
     serverLogFile << "========================\n\n";
