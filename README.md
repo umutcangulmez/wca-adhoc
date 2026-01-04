@@ -42,4 +42,4 @@ M. Chatterjee, S. K. Das, and D. Turgut, "WCA: A Weighted Clustering Algorithm f
 ## Author
 
 Umut Can Gülmez  
-CENG513 Term Project - METU, Fall 2025-2026
+CENG797 Term Project - METU, Fall 2025-2026
