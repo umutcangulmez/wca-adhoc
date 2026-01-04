@@ -240,6 +240,7 @@ void HwcaServer::checkRobotTimeouts()
 
         if (state.isConnected && (now - state.lastReportTime) > robotTimeoutThreshold) {
             state.isConnected = false;
+            state.networkMode = 3;
             connectedRobots.erase(pair.first);
             disconnectedRobots.insert(pair.first);
 
@@ -388,8 +389,10 @@ void HwcaServer::finish()
 
     for (const auto& pair : robotStates) {
         const RobotState& state = pair.second;
-        if (!state.isConnected) continue;
-
+        if (!state.isConnected) {
+          disconnectedModeCount++;
+          continue;
+        }
         switch (state.networkMode) {
             case 0: directAPCount++; break;      // DIRECT_AP
             case 1: gatewayCount++; break;       // GATEWAY
@@ -397,7 +400,10 @@ void HwcaServer::finish()
             case 3: disconnectedModeCount++; break; // DISCONNECTED
         }
     }
-
+    int totalTracked = robotStates.size();
+    if (totalTracked < expectedRobotCount) {
+      disconnectedModeCount += (expectedRobotCount - totalTracked);
+    }
     // Calculate connectivity ratio
     double connectivityRatio = 0.0;
     if (expectedRobotCount > 0) {
